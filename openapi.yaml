@@ -1,0 +1,405 @@
+openapi: 3.0.3
+info:
+  title: RAG-Anything API Server
+  description: |
+    RAG-Anything Document Processing API Service
+    
+    This service provides powerful multimodal document parsing capabilities, supporting conversion of various document formats to Markdown.
+    
+    ## Key Features
+    
+    * **Multi-format Support**: PDF, Office documents (Word, PowerPoint, Excel), images, text files
+    * **Intelligent Parsing**: Automatically extracts text, tables, formulas, and images
+    * **Multiple Parsers**: Supports MinerU and Docling parsing engines
+    * **GPU Acceleration**: Optional GPU acceleration to improve OCR and table extraction speed
+    * **Streaming Processing**: Supports real-time streaming of processing results
+    
+    ## Supported Document Formats
+    
+    * **PDF**: Full support, including OCR, table, and formula extraction
+    * **Office Documents**: DOC, DOCX, PPT, PPTX, XLS, XLSX (requires LibreOffice)
+    * **Images**: JPG, PNG, BMP, TIFF, GIF, WebP (supports OCR)
+    * **Text**: TXT, MD
+    
+    ## Usage Instructions
+    
+    1. Upload document to `/api/v1/process` endpoint
+    2. Select parser and processing options
+    3. Get converted Markdown content
+    
+    For more information, please refer to: https://github.com/HKUDS/RAG-Anything
+  version: 1.0.0
+  contact:
+    name: RAG-Anything
+    url: https://github.com/HKUDS/RAG-Anything
+  license:
+    name: MIT
+    url: https://github.com/HKUDS/RAG-Anything/blob/main/LICENSE
+
+servers:
+  - url: http://localhost:8000
+    description: Local development server
+  - url: https://api.example.com
+    description: Production server (example)
+
+tags:
+  - name: Health
+    description: Health check related endpoints
+  - name: Document Processing
+    description: Document processing related endpoints
+
+paths:
+  /health:
+    get:
+      tags:
+        - Health
+      summary: Health check
+      description: |
+        Check if the service is running normally and if the RAG instance is initialized
+        
+        Returns the health status of the service, including:
+        - Service status
+        - Service name
+        - RAG instance initialization status
+      operationId: healthCheck
+      responses:
+        '200':
+          description: Service running normally
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HealthResponse'
+              example:
+                status: healthy
+                service: rag-anything-api
+                rag_initialized: true
+
+  /api/v1/process:
+    post:
+      tags:
+        - Document Processing
+      summary: Process document and convert to Markdown
+      description: |
+        Upload document and convert to Markdown format
+        
+        This endpoint receives file uploads, processes documents using RAG-Anything, and returns extracted Markdown content.
+        Supports multiple document formats including PDF, Office documents, images, etc.
+        
+        ## Processing Flow
+        
+        1. Receive uploaded file
+        2. Select parser based on file type (MinerU or Docling)
+        3. Extract text, tables, formulas, images, etc.
+        4. Convert to Markdown format
+        5. Return processing results and metadata
+        
+        ## Parameter Description
+        
+        - **parser**: Parser selection
+          - `auto`: Automatically select based on file type (recommended)
+          - `mineru`: Use MinerU parser (suitable for PDF, images)
+          - `docling`: Use Docling parser (suitable for Office documents)
+        
+        - **parse_method**: Parse method
+          - `auto`: Automatically select best method
+          - `ocr`: Force OCR usage (suitable for scanned documents)
+          - `txt`: Extract text only (fastest)
+        
+        - **language**: Document language (for OCR optimization)
+          - `zh`: Chinese
+          - `en`: English
+          - Other language codes
+        
+        - **device**: Processing device
+          - `cpu`: CPU processing (default)
+          - `cuda:0`: GPU acceleration (requires NVIDIA GPU)
+          - `mps`: Apple Silicon GPU
+        
+        - **formula**: Whether to extract formulas (default: true)
+        - **table**: Whether to extract tables (default: true)
+      operationId: processDocument
+      requestBody:
+        required: true
+        content:
+          multipart/form-data:
+            schema:
+              type: object
+              required:
+                - file
+              properties:
+                file:
+                  type: string
+                  format: binary
+                  description: Document file to process (supports PDF, Office documents, images, etc.)
+                parser:
+                  type: string
+                  enum: [auto, mineru, docling]
+                  default: auto
+                  description: Parser selection
+                parse_method:
+                  type: string
+                  enum: [auto, ocr, txt]
+                  default: auto
+                  description: Parse method
+                language:
+                  type: string
+                  default: zh
+                  description: Document language (for OCR optimization)
+                device:
+                  type: string
+                  enum: [cpu, cuda:0, mps]
+                  default: cpu
+                  description: Processing device
+                formula:
+                  type: boolean
+                  default: true
+                  description: Whether to extract formulas
+                table:
+                  type: boolean
+                  default: true
+                  description: Whether to extract tables
+                backend:
+                  type: string
+                  default: pipeline
+                  description: Backend type
+            encoding:
+              file:
+                contentType: application/pdf, application/vnd.openxmlformats-officedocument.wordprocessingml.document, image/jpeg, image/png, etc.
+      responses:
+        '200':
+          description: Processing successful
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ProcessDocumentResponse'
+              example:
+                success: true
+                markdown: |
+                  # Document Title
+                  
+                  This is the extracted content...
+                  
+                  | Table | Data |
+                  |-------|------|
+                  | Col1  | Val1 |
+                  | Col2  | Val2 |
+                  
+                  $$E = mc^2$$
+                metadata:
+                  parser: mineru
+                  parse_method: auto
+                  doc_id: doc_123456
+                  tables: 3
+                  formulas: 5
+                  images: 2
+                error: null
+        '400':
+          description: Invalid request parameters
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+              example:
+                detail: Invalid file format or missing file
+        '503':
+          description: Service not initialized
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+              example:
+                detail: RAG-Anything service not initialized. Please check server logs.
+
+  /api/v1/process-stream:
+    post:
+      tags:
+        - Document Processing
+      summary: Stream document processing
+      description: |
+        Stream document processing and return Markdown fragments in real-time
+        
+        This endpoint uses Server-Sent Events (SSE) to return processing results in real-time, suitable for large documents and scenarios requiring real-time feedback.
+        
+        ## Response Format
+        
+        Returns a stream in `text/event-stream` format, each data chunk starts with `data: `:
+        
+        ```
+        data: First segment content
+
+        data: Second segment content
+
+        data: | Table | Data |
+        |------|------|
+        | ... | ... |
+
+        data: $$Formula content$$
+
+        data: [DONE]
+        ```
+        
+        ## Error Handling
+        
+        If an error occurs during processing, it returns:
+        ```
+        data: [ERROR] Error message
+        ```
+      operationId: processDocumentStream
+      requestBody:
+        required: true
+        content:
+          multipart/form-data:
+            schema:
+              type: object
+              required:
+                - file
+              properties:
+                file:
+                  type: string
+                  format: binary
+                  description: Document file to process
+                parser:
+                  type: string
+                  enum: [auto, mineru, docling]
+                  default: auto
+                  description: Parser selection
+                parse_method:
+                  type: string
+                  enum: [auto, ocr, txt]
+                  default: auto
+                  description: Parse method
+                language:
+                  type: string
+                  default: zh
+                  description: Document language
+                device:
+                  type: string
+                  enum: [cpu, cuda:0, mps]
+                  default: cpu
+                  description: Processing device
+                formula:
+                  type: boolean
+                  default: true
+                  description: Whether to extract formulas
+                table:
+                  type: boolean
+                  default: true
+                  description: Whether to extract tables
+                backend:
+                  type: string
+                  default: pipeline
+                  description: Backend type
+      responses:
+        '200':
+          description: Streaming response
+          content:
+            text/event-stream:
+              schema:
+                type: string
+              example: |
+                data: Content fragment
+
+                data: [DONE]
+
+        '503':
+          description: Service not initialized
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+
+components:
+  schemas:
+    HealthResponse:
+      type: object
+      required:
+        - status
+        - service
+        - rag_initialized
+      properties:
+        status:
+          type: string
+          description: Service status
+          example: healthy
+        service:
+          type: string
+          description: Service name
+          example: rag-anything-api
+        rag_initialized:
+          type: boolean
+          description: Whether RAG instance is initialized
+          example: true
+
+    DocumentMetadata:
+      type: object
+      required:
+        - parser
+        - parse_method
+        - doc_id
+        - tables
+        - formulas
+        - images
+      properties:
+        parser:
+          type: string
+          description: Parser used (mineru or docling)
+          example: mineru
+        parse_method:
+          type: string
+          description: Parse method used (auto, ocr, txt)
+          example: auto
+        doc_id:
+          type: string
+          description: Document ID
+          example: doc_123456
+        tables:
+          type: integer
+          description: Number of tables extracted
+          example: 3
+        formulas:
+          type: integer
+          description: Number of formulas extracted
+          example: 5
+        images:
+          type: integer
+          description: Number of images extracted
+          example: 2
+
+    ProcessDocumentResponse:
+      type: object
+      required:
+        - success
+        - markdown
+      properties:
+        success:
+          type: boolean
+          description: Whether processing was successful
+          example: true
+        markdown:
+          type: string
+          description: Converted Markdown content
+          example: |
+            # Document Title
+            
+            This is the extracted content...
+            
+            | Table | Data |
+            |-------|------|
+            | Col1  | Val1 |
+        metadata:
+          $ref: '#/components/schemas/DocumentMetadata'
+          description: Document metadata
+        error:
+          type: string
+          nullable: true
+          description: Error message (if processing failed)
+          example: null
+
+    ErrorResponse:
+      type: object
+      properties:
+        detail:
+          type: string
+          description: Error details
+          example: Error message here
+
