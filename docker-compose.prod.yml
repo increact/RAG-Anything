@@ -1,0 +1,63 @@
+version: "3.8"
+
+# Production Docker Compose configuration for AWS Alma Linux 9
+# This configuration is optimized for production deployment
+
+services:
+  rag-anything-api:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: rag-anything-api-prod
+    image: rag-anything-api:latest
+    restart: always
+    ports:
+      - "8000"
+    environment:
+      - NODE_ENV=production
+      - ENABLE_ACME=true
+      - VIRTUAL_HOST=${VIRTUAL_HOST:-}
+    env_file:
+      - .env
+    volumes:
+      - ./output:/app/output
+      - ./rag_storage:/app/rag_storage
+      - ./logs:/app/logs
+      - rag_models_cache:/root/.cache
+    networks:
+      - web_proxy
+    deploy:
+      resources:
+        limits:
+          cpus: "4.0"
+          memory: 8G
+        reservations:
+          cpus: "2.0"
+          memory: 4G
+    healthcheck:
+      test:
+        [
+          "CMD",
+          "python",
+          "-c",
+          "import requests; requests.get('http://localhost:8000/health')",
+        ]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 60s
+
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "100m"
+        max-file: "5"
+        compress: "true"
+
+volumes:
+  rag_models_cache:
+    driver: local
+
+networks:
+  web_proxy:
+    external: true
