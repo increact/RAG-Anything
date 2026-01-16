@@ -17,7 +17,8 @@ from typing import Optional, Dict, Any, List
 from contextlib import asynccontextmanager
 
 import uvicorn
-from fastapi import FastAPI, UploadFile, File, Form, HTTPException, BackgroundTasks, status
+from fastapi import FastAPI, UploadFile, File, Form, HTTPException, BackgroundTasks, status, Security, Depends
+from fastapi.security import APIKeyHeader
 from fastapi.responses import StreamingResponse, JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.openapi.utils import get_openapi
@@ -44,6 +45,51 @@ logger = logging.getLogger(__name__)
 
 # Global RAG instance (will be initialized on startup)
 rag_instance: Optional[RAGAnything] = None
+
+# API Key security configuration
+API_KEY_NAME = "X-API-Key"
+api_key_header = APIKeyHeader(name=API_KEY_NAME, auto_error=False)
+
+
+async def verify_api_key(api_key: Optional[str] = Security(api_key_header)):
+    """
+    Verify API key from request header
+    
+    Checks if the provided API key matches the configured API_KEY from environment.
+    If API_KEY is not set in environment, authentication is disabled (development mode).
+    
+    Args:
+        api_key: API key from X-API-Key header
+        
+    Raises:
+        HTTPException: If API key is invalid or missing (when API_KEY is configured)
+    """
+    # Get configured API key from environment
+    configured_api_key = os.getenv("API_KEY")
+    
+    # If no API key is configured, skip authentication (development mode)
+    if not configured_api_key:
+        logger.warning("API_KEY not configured - authentication is disabled!")
+        return None
+    
+    # Check if API key is provided
+    if not api_key:
+        logger.warning("API request without API key")
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="API key is required. Please provide X-API-Key header.",
+            headers={"WWW-Authenticate": "ApiKey"},
+        )
+    
+    # Verify API key
+    if api_key != configured_api_key:
+        logger.warning(f"Invalid API key attempt: {api_key[:8]}...")
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Invalid API key",
+        )
+    
+    return api_key
 
 
 class ProcessDocumentRequest(BaseModel):
@@ -233,6 +279,7 @@ app.add_middleware(
     "/api/v1/doc/{doc_id}",
     tags=["Document Management"],
     summary="View document information",
+    dependencies=[Depends(verify_api_key)],
     description="""
     View processed document information by doc_id
     
@@ -302,6 +349,7 @@ async def get_document_by_id(doc_id: str):
     "/api/v1/doc-content/{doc_id}",
     tags=["Document Management"],
     summary="Get document Markdown content",
+    dependencies=[Depends(verify_api_key)],
     description="""
     Get complete Markdown content of a document by doc_id
     
@@ -360,6 +408,7 @@ async def get_document_content(doc_id: str):
     "/api/v1/debug/content-list/{doc_id}",
     tags=["Document Management"],
     summary="[Debug] View content_list",
+    dependencies=[Depends(verify_api_key)],
     description="""
     Debug endpoint: View raw content_list for specified doc_id
     
@@ -423,6 +472,7 @@ async def get_content_list(doc_id: str):
     "/api/v1/middle-json/{doc_id}",
     tags=["Document Management"],
     summary="Get document middle.json",
+    dependencies=[Depends(verify_api_key)],
     description="""
     Get middle.json file for a document by doc_id
     
@@ -520,6 +570,7 @@ async def health_check():
     response_model=ProcessDocumentResponse,
     tags=["Document Processing"],
     summary="Process document and convert to Markdown",
+    dependencies=[Depends(verify_api_key)],
     description="""
     Upload document and convert to Markdown format
     
@@ -860,6 +911,7 @@ async def process_document(
     "/api/v1/process-stream",
     tags=["Document Processing"],
     summary="Stream document processing",
+    dependencies=[Depends(verify_api_key)],
     description="""
     Stream document processing and return Markdown fragments in real-time
     
@@ -1059,6 +1111,7 @@ async def process_document_stream(
     response_model=ProcessContentListResponse,
     tags=["Document Processing"],
     summary="Process document and return content_list only (no markdown)",
+    dependencies=[Depends(verify_api_key)],
     description="""
     Upload document and return only content_list without generating markdown
     
