@@ -76,6 +76,14 @@ class ProcessDocumentResponse(BaseModel):
     debug_info: Optional[Dict[str, Any]] = Field(None, description="Debug information (development mode)")
 
 
+class ProcessContentListResponse(BaseModel):
+    """Response model for content_list-only processing"""
+    success: bool = Field(..., description="Whether processing was successful")
+    content_list: Optional[List[Dict[str, Any]]] = Field(None, description="Parsed content list")
+    metadata: Optional[DocumentMetadata] = Field(None, description="Document metadata")
+    error: Optional[str] = Field(None, description="Error message (if processing failed)")
+
+
 class HealthResponse(BaseModel):
     """Health check response"""
     status: str = Field(..., description="Service status", example="healthy")
@@ -408,6 +416,65 @@ async def get_content_list(doc_id: str):
         raise
     except Exception as e:
         logger.error(f"Error retrieving content_list {doc_id}: {str(e)}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get(
+    "/api/v1/middle-json/{doc_id}",
+    tags=["Document Management"],
+    summary="Get document middle.json",
+    description="""
+    Get middle.json file for a document by doc_id
+    
+    This endpoint searches the output directory, finds the middle.json file related to the doc_id, and returns its content.
+    The middle.json contains detailed layout information including preproc_blocks, lines, spans, etc.
+    """,
+)
+async def get_middle_json(doc_id: str):
+    """
+    Get document middle.json content
+    """
+    try:
+        output_dir = os.getenv("OUTPUT_DIR", "./output")
+        output_path = Path(output_dir)
+        
+        # Search for middle.json files
+        json_files = list(output_path.rglob("*_middle.json"))
+        
+        if not json_files:
+            raise HTTPException(
+                status_code=404,
+                detail=f"No middle.json files found in {output_dir}",
+            )
+        
+        # Sort by modification time, get the latest
+        json_files.sort(key=lambda p: p.stat().st_mtime, reverse=True)
+        latest_file = json_files[0]
+        
+        try:
+            with open(latest_file, "r", encoding="utf-8") as f:
+                middle_json = json.load(f)
+            
+            return {
+                "doc_id": doc_id,
+                "source_file": str(latest_file.relative_to(output_path)),
+                "middle_json": middle_json,
+            }
+        except json.JSONDecodeError as e:
+            raise HTTPException(
+                status_code=500,
+                detail=f"Failed to parse middle.json file: {str(e)}",
+            )
+        except Exception as e:
+            raise HTTPException(
+                status_code=500,
+                detail=f"Failed to read middle.json file: {str(e)}",
+            )
+            
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error retrieving middle.json {doc_id}: {str(e)}")
         raise HTTPException(status_code=500, detail=str(e))
 
 
@@ -985,6 +1052,230 @@ async def process_document_stream(
             "X-Accel-Buffering": "no",
         },
     )
+
+
+@app.post(
+    "/api/v1/process-content-list",
+    response_model=ProcessContentListResponse,
+    tags=["Document Processing"],
+    summary="Process document and return content_list only (no markdown)",
+    description="""
+    Upload document and return only content_list without generating markdown
+    
+    This endpoint is optimized for structured indexing scenarios where markdown is not needed.
+    It processes documents using RAG-Anything and returns only the structured content_list.
+    
+    ## Use Cases
+    
+    - Pure indexing scenarios (no user viewing/editing needed)
+    - Batch processing large volumes of documents
+    - Scenarios requiring maximum processing speed
+    
+    ## Response Format
+    
+    Returns only content_list and metadata, skipping markdown generation entirely.
+    """,
+    responses={
+        200: {
+            "description": "Processing successful",
+            "content": {
+                "application/json": {
+                    "example": {
+                        "success": True,
+                        "content_list": [
+                            {
+                                "type": "text",
+                                "text": "Document content...",
+                                "text_level": 1,
+                                "page_idx": 0,
+                            },
+                            {
+                                "type": "table",
+                                "table_body": "| Col1 | Col2 |\n|------|------|",
+                                "table_caption": ["Table 1"],
+                            },
+                        ],
+                        "metadata": {
+                            "parser": "mineru",
+                            "parse_method": "auto",
+                            "doc_id": "doc_123456",
+                            "tables": 3,
+                            "formulas": 5,
+                            "images": 2,
+                        },
+                        "error": None,
+                    }
+                }
+            },
+        },
+        400: {
+            "description": "Invalid request parameters",
+        },
+        503: {
+            "description": "Service not initialized",
+        },
+    },
+)
+async def process_document_content_list(
+    file: UploadFile = File(
+        ...,
+        description="Document file to process",
+        example="document.pdf",
+    ),
+    parser: str = Form(
+        "auto",
+        description="Parser selection: auto (automatic), mineru, docling",
+        example="auto",
+    ),
+    parse_method: str = Form(
+        "auto",
+        description="Parse method: auto (automatic), ocr, txt",
+        example="auto",
+    ),
+    language: str = Form(
+        "zh",
+        description="Document language (for OCR optimization): zh (Chinese), en (English), etc.",
+        example="zh",
+    ),
+    device: str = Form(
+        "cpu",
+        description="Processing device: cpu, cuda:0 (GPU), mps (Apple Silicon)",
+        example="cpu",
+    ),
+    formula: bool = Form(
+        True,
+        description="Whether to extract formulas",
+        example=True,
+    ),
+    table: bool = Form(
+        True,
+        description="Whether to extract tables",
+        example=True,
+    ),
+    backend: str = Form(
+        "pipeline",
+        description="Backend type: pipeline, vlm-transformers",
+        example="pipeline",
+    ),
+):
+    """
+    Process document and return only content_list (no markdown generation)
+    
+    Optimized endpoint for structured indexing scenarios.
+    """
+    if rag_instance is None:
+        raise HTTPException(
+            status_code=503,
+            detail="RAG-Anything service not initialized. Please check server logs."
+        )
+    
+    temp_file = None
+    
+    try:
+        # Read file content
+        file_content = await file.read()
+        
+        # Create temporary file
+        with tempfile.NamedTemporaryFile(delete=False, suffix=Path(file.filename).suffix) as tmp:
+            tmp.write(file_content)
+            temp_file = tmp.name
+        
+        logger.info(f"Processing file (content_list only): {file.filename} (size: {len(file_content)} bytes)")
+        
+        # Determine parser
+        if parser == "auto":
+            file_ext = Path(file.filename).suffix.lower()
+            if file_ext in [".doc", ".docx", ".ppt", ".pptx", ".xls", ".xlsx"]:
+                selected_parser = "docling"
+            else:
+                selected_parser = "mineru"
+        else:
+            selected_parser = parser
+        
+        # Prepare parser kwargs
+        parser_kwargs = {
+            "lang": language,
+            "device": device,
+            "formula": formula,
+            "table": table,
+            "backend": backend,
+        }
+        
+        # Process document using RAG-Anything
+        output_dir = os.getenv("OUTPUT_DIR", "./output")
+        os.makedirs(output_dir, exist_ok=True)
+        
+        # Update config with selected parser
+        rag_instance.config.parser = selected_parser
+        
+        # Parse document using RAG-Anything's parse_document method
+        content_list, doc_id = await rag_instance.parse_document(
+            temp_file,
+            output_dir,
+            parse_method,
+            display_stats=True,
+            **parser_kwargs,
+        )
+        
+        logger.info(f"Parsed document: {len(content_list)} content blocks, doc_id: {doc_id}")
+        
+        # Calculate metadata from content_list
+        metadata = {
+            "parser": selected_parser,
+            "parse_method": parse_method,
+            "doc_id": doc_id,
+            "tables": 0,
+            "formulas": 0,
+            "images": 0,
+        }
+        
+        for item in content_list:
+            if isinstance(item, dict):
+                content_type = item.get("type", "text")
+                if content_type == "table":
+                    metadata["tables"] += 1
+                elif content_type == "equation":
+                    metadata["formulas"] += 1
+                elif content_type == "image":
+                    metadata["images"] += 1
+        
+        if not content_list or len(content_list) == 0:
+            raise HTTPException(
+                status_code=400,
+                detail="Failed to extract content from document. The document may be empty or unsupported."
+            )
+        
+        logger.info(f"✅ Successfully processed {file.filename} (content_list only)")
+        logger.info(f"   - Tables: {metadata['tables']}, Formulas: {metadata['formulas']}, Images: {metadata['images']}")
+        logger.info(f"   - Content list items: {len(content_list)}")
+        logger.info(f"   - Doc ID: {doc_id}")
+        
+        return ProcessContentListResponse(
+            success=True,
+            content_list=content_list,
+            metadata=DocumentMetadata(**metadata),
+            error=None,
+        )
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"❌ Error processing document (content_list only): {str(e)}")
+        logger.exception(e)
+        return ProcessContentListResponse(
+            success=False,
+            content_list=None,
+            metadata=None,
+            error=str(e),
+        )
+    
+    finally:
+        # Cleanup temporary file
+        if temp_file and os.path.exists(temp_file):
+            try:
+                os.unlink(temp_file)
+            except Exception as e:
+                logger.warning(f"Failed to delete temp file: {e}")
 
 
 if __name__ == "__main__":
