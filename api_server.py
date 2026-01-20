@@ -31,17 +31,24 @@ sys.path.insert(0, str(Path(__file__).parent))
 # Load environment variables
 load_dotenv(dotenv_path=".env", override=False)
 
-# Import RAG-Anything
-from raganything import RAGAnything, RAGAnythingConfig
-from lightrag.llm.openai import openai_complete_if_cache, openai_embed
-from lightrag.utils import EmbeddingFunc
-
-# Configure logging
+# Configure logging first
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
 )
 logger = logging.getLogger(__name__)
+
+# Import RAG-Anything
+from raganything import RAGAnything, RAGAnythingConfig
+
+# LightRAG imports (only needed if LightRAG is enabled)
+try:
+    from lightrag.llm.openai import openai_complete_if_cache, openai_embed
+    from lightrag.utils import EmbeddingFunc
+    LIGHTRAG_AVAILABLE = True
+except ImportError:
+    LIGHTRAG_AVAILABLE = False
+    logger.warning("LightRAG imports not available, RAG features will be disabled")
 
 # Global RAG instance (will be initialized on startup)
 rag_instance: Optional[RAGAnything] = None
@@ -135,6 +142,7 @@ class HealthResponse(BaseModel):
     status: str = Field(..., description="Service status", example="healthy")
     service: str = Field(..., description="Service name", example="rag-anything-api")
     rag_initialized: bool = Field(..., description="Whether RAG instance is initialized")
+    lightrag_enabled: bool = Field(..., description="Whether LightRAG is enabled")
 
 
 @asynccontextmanager
@@ -142,17 +150,16 @@ async def lifespan(app: FastAPI):
     """Lifespan context manager for FastAPI startup/shutdown"""
     global rag_instance
     
+    # Check if LightRAG is enabled
+    enable_lightrag = os.getenv("ENABLE_LIGHTRAG", "true").lower() in ("true", "1", "yes")
+    
     # Startup: Initialize RAG instance
-    logger.info("Initializing RAG-Anything service...")
+    if enable_lightrag:
+        logger.info("Initializing RAG-Anything service with LightRAG...")
+    else:
+        logger.info("Initializing RAG-Anything service (LightRAG disabled, parsing only)...")
+    
     try:
-        # Get API key from environment
-        api_key = os.getenv("OPENAI_API_KEY") or os.getenv("LLM_BINDING_API_KEY")
-        base_url = os.getenv("OPENAI_BASE_URL") or os.getenv("LLM_BINDING_HOST")
-        
-        if not api_key:
-            logger.warning("No API key found. Some features may not work.")
-            api_key = "dummy-key"  # Will fail gracefully if needed
-        
         # Create configuration
         config = RAGAnythingConfig(
             working_dir=os.getenv("WORKING_DIR", "./rag_storage"),
@@ -163,41 +170,66 @@ async def lifespan(app: FastAPI):
             enable_equation_processing=True,
         )
         
-        # Define LLM function
-        def llm_model_func(prompt, system_prompt=None, history_messages=[], **kwargs):
-            return openai_complete_if_cache(
-                os.getenv("LLM_MODEL", "gpt-4o-mini"),
-                prompt,
-                system_prompt=system_prompt,
-                history_messages=history_messages,
-                api_key=api_key,
-                base_url=base_url,
-                **kwargs,
+        if enable_lightrag:
+            if not LIGHTRAG_AVAILABLE:
+                logger.error("LightRAG is enabled but imports are not available. Please install lightrag package.")
+                raise ImportError("LightRAG imports not available")
+            
+            # Get API key from environment
+            api_key = os.getenv("OPENAI_API_KEY") or os.getenv("LLM_BINDING_API_KEY")
+            base_url = os.getenv("OPENAI_BASE_URL") or os.getenv("LLM_BINDING_HOST")
+            
+            if not api_key:
+                logger.warning("No API key found. Some features may not work.")
+                api_key = "dummy-key"  # Will fail gracefully if needed
+            
+            # Define LLM function
+            def llm_model_func(prompt, system_prompt=None, history_messages=[], **kwargs):
+                return openai_complete_if_cache(
+                    os.getenv("LLM_MODEL", "gpt-4o-mini"),
+                    prompt,
+                    system_prompt=system_prompt,
+                    history_messages=history_messages,
+                    api_key=api_key,
+                    base_url=base_url,
+                    **kwargs,
+                )
+            
+            # Define embedding function
+            embedding_model = os.getenv("EMBEDDING_MODEL", "text-embedding-3-large")
+            embedding_dim = int(os.getenv("EMBEDDING_DIM", "3072"))
+            
+            embedding_func = EmbeddingFunc(
+                embedding_dim=embedding_dim,
+                max_token_size=8192,
+                func=lambda texts: openai_embed(
+                    texts,
+                    model=embedding_model,
+                    api_key=api_key,
+                    base_url=base_url,
+                ),
             )
-        
-        # Define embedding function
-        embedding_model = os.getenv("EMBEDDING_MODEL", "text-embedding-3-large")
-        embedding_dim = int(os.getenv("EMBEDDING_DIM", "3072"))
-        
-        embedding_func = EmbeddingFunc(
-            embedding_dim=embedding_dim,
-            max_token_size=8192,
-            func=lambda texts: openai_embed(
-                texts,
-                model=embedding_model,
-                api_key=api_key,
-                base_url=base_url,
-            ),
-        )
-        
-        # Initialize RAG-Anything
-        rag_instance = RAGAnything(
-            config=config,
-            llm_model_func=llm_model_func,
-            embedding_func=embedding_func,
-        )
-        
-        logger.info("✅ RAG-Anything service initialized successfully")
+            
+            # Initialize RAG-Anything with LightRAG
+            rag_instance = RAGAnything(
+                config=config,
+                llm_model_func=llm_model_func,
+                embedding_func=embedding_func,
+            )
+            
+            logger.info("✅ RAG-Anything service initialized successfully with LightRAG")
+        else:
+            # Initialize RAG-Anything without LightRAG (parsing only)
+            # Create a dummy LightRAG instance to satisfy initialization requirements
+            # but we won't use it for RAG operations
+            rag_instance = RAGAnything(
+                config=config,
+                llm_model_func=None,
+                embedding_func=None,
+            )
+            # Set lightrag to None explicitly to disable RAG features
+            rag_instance.lightrag = None
+            logger.info("✅ RAG-Anything service initialized successfully (parsing only, LightRAG disabled)")
         
     except Exception as e:
         logger.error(f"❌ Failed to initialize RAG-Anything: {str(e)}")
@@ -557,11 +589,14 @@ async def health_check():
     - Service status
     - Service name
     - RAG instance initialization status
+    - LightRAG enabled status
     """
+    enable_lightrag = os.getenv("ENABLE_LIGHTRAG", "true").lower() in ("true", "1", "yes")
     return HealthResponse(
         status="healthy",
         service="rag-anything-api",
         rag_initialized=rag_instance is not None,
+        lightrag_enabled=enable_lightrag and (rag_instance is not None and rag_instance.lightrag is not None),
     )
 
 
