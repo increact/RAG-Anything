@@ -36,7 +36,8 @@ RUN pip install --no-cache-dir --upgrade pip && \
     uvicorn[standard] \
     python-multipart \
     python-dotenv \
-    pydantic
+    pydantic \
+    rq
 
 # Copy application code
 COPY . .

@@ -1,0 +1,212 @@
+"""
+Document processing worker for handling queued tasks
+"""
+import os
+import asyncio
+import tempfile
+import logging
+import httpx
+from typing import Dict, Any
+from pathlib import Path
+from urllib.parse import urlparse, unquote
+
+logger = logging.getLogger(__name__)
+
+# Global RAG instance (will be set by worker initialization)
+rag_instance = None
+
+
+def set_rag_instance(instance):
+    """Set the global RAG instance"""
+    global rag_instance
+    rag_instance = instance
+
+
+async def process_document_task_async(task_data: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Process document task asynchronously
+    
+    Args:
+        task_data: Task data containing document_id, s3_url, processing_options, etc.
+    
+    Returns:
+        Dict with processing results
+    """
+    task_id = task_data["task_id"]
+    document_id = task_data["document_id"]
+    project_id = task_data["project_id"]
+    webhook_url = task_data["webhook_url"]
+    s3_url = task_data["s3_url"]
+    processing_options = task_data["processing_options"]
+    
+    temp_file = None
+    
+    try:
+        logger.info(f"Processing task {task_id} for document {document_id}")
+        
+        if rag_instance is None:
+            raise Exception("RAG instance not initialized")
+        
+        # Download file from S3
+        logger.info(f"Downloading file from S3: {s3_url}")
+        async with httpx.AsyncClient(timeout=300.0) as client:
+            response = await client.get(s3_url)
+            response.raise_for_status()
+            file_content = response.content
+        
+        # Create temporary file
+        # Extract file extension from URL path (without query parameters)
+        parsed_url = urlparse(s3_url)
+        url_path = unquote(parsed_url.path)  # Decode URL encoding
+        file_ext = Path(url_path).suffix or ".pdf"
+        
+        with tempfile.NamedTemporaryFile(delete=False, suffix=file_ext) as tmp:
+            tmp.write(file_content)
+            temp_file = tmp.name
+        
+        logger.info(f"File saved to temporary location: {temp_file}")
+        
+        # Process document
+        output_dir = os.getenv("OUTPUT_DIR", "./output")
+        os.makedirs(output_dir, exist_ok=True)
+        
+        parser = processing_options.get("parser", "auto")
+        parse_method = processing_options.get("parseMethod", "auto")
+        language = processing_options.get("language", "zh")
+        device = processing_options.get("device", "cpu")
+        
+        parser_kwargs = {
+            "lang": language,
+            "device": device,
+            "formula": processing_options.get("formula", True),
+            "table": processing_options.get("table", True),
+            "backend": processing_options.get("backend", "pipeline"),
+        }
+        
+        # If session_id is provided, add to parser_kwargs
+        if "sessionId" in processing_options:
+            parser_kwargs["session_id"] = processing_options["sessionId"]
+        
+        # Auto-select parser
+        if parser == "auto":
+            file_ext = Path(temp_file).suffix.lower()
+            if file_ext in [".doc", ".docx", ".ppt", ".pptx", ".xls", ".xlsx"]:
+                selected_parser = "docling"
+            else:
+                selected_parser = "mineru"
+        else:
+            selected_parser = parser
+        
+        # Update config
+        rag_instance.config.parser = selected_parser
+        
+        logger.info(f"Parsing document with parser: {selected_parser}, method: {parse_method}")
+        
+        # Parse document
+        content_list, doc_id = await rag_instance.parse_document(
+            temp_file,
+            output_dir,
+            parse_method,
+            display_stats=True,
+            **parser_kwargs,
+        )
+        
+        logger.info(f"Document parsed successfully, doc_id: {doc_id}")
+        
+        # Read markdown
+        file_stem = Path(temp_file).stem
+        md_file = Path(output_dir) / f"{file_stem}.md"
+        markdown = ""
+        if md_file.exists():
+            with open(md_file, "r", encoding="utf-8") as f:
+                markdown = f.read()
+        
+        # Fix webhook URL for Docker networking
+        # Replace localhost with host.docker.internal to allow container to reach host
+        fixed_webhook_url = webhook_url.replace("localhost", "host.docker.internal")
+        if fixed_webhook_url != webhook_url:
+            logger.info(f"Fixed webhook URL for Docker: {webhook_url} -> {fixed_webhook_url}")
+        
+        # Send webhook (with retry)
+        from raganything.webhook_service import WebhookService
+        
+        webhook_success = await WebhookService.send_webhook_with_retry(
+            webhook_url=fixed_webhook_url,
+            doc_id=doc_id,
+            document_id=document_id,
+            project_id=project_id,
+            status="completed",
+            markdown=markdown,
+            content_list=content_list,
+            max_retries=3,
+        )
+        
+        if not webhook_success:
+            logger.warning(
+                f"⚠️ Webhook failed for task {task_id} but document processing succeeded. "
+                f"Document ID: {doc_id}. Client can fetch results via API."
+            )
+            # Don't raise exception - document processing succeeded
+            # Just log the webhook failure
+        
+        return {
+            "success": True,
+            "doc_id": doc_id,
+            "webhook_sent": webhook_success,
+        }
+        
+    except Exception as e:
+        logger.error(f"Error processing task {task_id}: {str(e)}")
+        logger.exception(e)
+        
+        # Send failure webhook
+        try:
+            from raganything.webhook_service import WebhookService
+            
+            # Fix webhook URL for Docker networking
+            fixed_webhook_url = webhook_url.replace("localhost", "host.docker.internal")
+            if fixed_webhook_url != webhook_url:
+                logger.info(f"Fixed webhook URL for Docker: {webhook_url} -> {fixed_webhook_url}")
+            
+            await WebhookService.send_webhook_with_retry(
+                webhook_url=fixed_webhook_url,
+                doc_id="",
+                document_id=document_id,
+                project_id=project_id,
+                status="failed",
+                error=str(e),
+                max_retries=3,
+            )
+        except Exception as webhook_error:
+            logger.error(f"Failed to send failure webhook: {webhook_error}")
+        
+        # Re-raise exception to mark task as failed
+        raise
+    
+    finally:
+        # Clean up temporary file
+        if temp_file and os.path.exists(temp_file):
+            try:
+                os.unlink(temp_file)
+            except Exception as e:
+                logger.warning(f"Failed to delete temp file {temp_file}: {e}")
+
+
+def process_document_task(task_data: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Synchronous wrapper for RQ worker
+    
+    Args:
+        task_data: Task data containing document_id, s3_url, processing_options, etc.
+    
+    Returns:
+        Dict with processing results
+    """
+    # Run async function
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
+    try:
+        return loop.run_until_complete(process_document_task_async(task_data))
+    finally:
+        loop.close()
+

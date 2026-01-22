@@ -3,7 +3,7 @@
 FastAPI server for RAG-Anything document processing service
 
 This service exposes an API endpoint for processing documents and returning markdown.
-Designed to be called from the tandra-ai-write backend service.
+Designed to be called from the client backend service.
 """
 
 import os
@@ -17,6 +17,7 @@ from typing import Optional, Dict, Any, List
 from contextlib import asynccontextmanager
 
 import uvicorn
+import httpx
 from fastapi import FastAPI, UploadFile, File, Form, HTTPException, BackgroundTasks, status, Security, Depends
 from fastapi.security import APIKeyHeader
 from fastapi.responses import StreamingResponse, JSONResponse
@@ -99,6 +100,67 @@ async def verify_api_key(api_key: Optional[str] = Security(api_key_header)):
     return api_key
 
 
+async def send_webhook_callback(
+    webhook_url: str,
+    doc_id: str,
+    document_id: str,
+    project_id: str,
+    status: str,
+    error: Optional[str] = None,
+    markdown: Optional[str] = None,
+    content_list: Optional[List[Dict[str, Any]]] = None,
+):
+    """
+    Send webhook callback to client when document processing is complete
+    
+    Args:
+        webhook_url: URL to send webhook to
+        doc_id: RAG Anything document ID
+        document_id: Client document ID
+        project_id: Client project ID
+        status: Processing status ('completed' or 'failed')
+        error: Error message if status is 'failed'
+        markdown: Markdown content if status is 'completed' (optional, can be fetched via API)
+        content_list: Content list if status is 'completed' (optional, can be fetched via API)
+    """
+    try:
+        payload = {
+            "docId": doc_id,
+            "documentId": document_id,
+            "projectId": project_id,
+            "status": status,
+        }
+        
+        if error:
+            payload["error"] = error
+        
+        # Include metadata if available (optional, client can fetch via API)
+        if status == "completed" and (markdown or content_list):
+            payload["metadata"] = {}
+            if markdown:
+                payload["metadata"]["markdown"] = markdown
+            if content_list:
+                payload["metadata"]["contentList"] = content_list
+        
+        logger.info(f"Sending webhook to {webhook_url} for document {document_id} (status: {status})")
+        
+        async with httpx.AsyncClient(timeout=30.0) as client:
+            response = await client.post(
+                webhook_url,
+                json=payload,
+                headers={"Content-Type": "application/json"},
+            )
+            response.raise_for_status()
+            logger.info(f"✅ Webhook sent successfully for document {document_id}")
+    
+    except httpx.HTTPError as e:
+        logger.error(f"❌ Failed to send webhook for document {document_id}: {str(e)}")
+        # Don't raise - webhook failure shouldn't affect the main response
+    except Exception as e:
+        logger.error(f"❌ Unexpected error sending webhook for document {document_id}: {str(e)}")
+        logger.exception(e)
+
+
 class ProcessDocumentRequest(BaseModel):
     """Request model for document processing"""
     parser: Optional[str] = Field(default="auto", description="Parser: auto, mineru, or docling")
@@ -149,6 +211,9 @@ class HealthResponse(BaseModel):
 async def lifespan(app: FastAPI):
     """Lifespan context manager for FastAPI startup/shutdown"""
     global rag_instance
+    
+    # Initialize document worker with RAG instance
+    from raganything.document_worker import set_rag_instance
     
     # Check if LightRAG is enabled
     enable_lightrag = os.getenv("ENABLE_LIGHTRAG", "true").lower() in ("true", "1", "yes")
@@ -230,6 +295,10 @@ async def lifespan(app: FastAPI):
             # Set lightrag to None explicitly to disable RAG features
             rag_instance.lightrag = None
             logger.info("✅ RAG-Anything service initialized successfully (parsing only, LightRAG disabled)")
+        
+        # Set RAG instance for document worker
+        set_rag_instance(rag_instance)
+        logger.info("✅ Document worker initialized")
         
     except Exception as e:
         logger.error(f"❌ Failed to initialize RAG-Anything: {str(e)}")
@@ -601,6 +670,77 @@ async def health_check():
 
 
 @app.post(
+    "/api/v1/queue/document",
+    tags=["Document Processing"],
+    summary="Queue document for processing",
+    dependencies=[Depends(verify_api_key)],
+    description="""
+    Queue a document for asynchronous processing.
+    
+    This endpoint accepts a document task and adds it to the processing queue.
+    The document will be processed by a background worker, and a webhook will be
+    sent to the specified URL when processing is complete.
+    """,
+)
+async def queue_document(
+    document_id: str = Form(..., description="Client document ID"),
+    project_id: str = Form(..., description="Client project ID"),
+    webhook_url: str = Form(..., description="Webhook URL to call when processing is complete"),
+    s3_url: str = Form(..., description="S3 URL of the document file"),
+    processing_options: str = Form(..., description="JSON string of processing options"),
+):
+    """Add document task to processing queue"""
+    from raganything.mq_service import DocumentProcessingQueue
+    from datetime import datetime
+    
+    if rag_instance is None:
+        raise HTTPException(
+            status_code=503,
+            detail="RAG-Anything service not initialized. Please check server logs."
+        )
+    
+    try:
+        # Parse processing options
+        options = json.loads(processing_options)
+        task_id = f"task-{document_id}-{int(datetime.now().timestamp() * 1000)}"
+        
+        # Create queue service
+        mq_service = DocumentProcessingQueue()
+        
+        # Add task to queue
+        job_id = mq_service.add_task(
+            task_id=task_id,
+            document_id=document_id,
+            project_id=project_id,
+            webhook_url=webhook_url,
+            s3_url=s3_url,
+            processing_options=options,
+        )
+        
+        logger.info(f"Queued document {document_id} for processing (task_id: {task_id}, job_id: {job_id})")
+        
+        return {
+            "success": True,
+            "task_id": task_id,
+            "job_id": job_id,
+            "message": "Document queued for processing",
+        }
+    except json.JSONDecodeError as e:
+        logger.error(f"Invalid JSON in processing_options: {str(e)}")
+        raise HTTPException(
+            status_code=400,
+            detail=f"Invalid JSON in processing_options: {str(e)}"
+        )
+    except Exception as e:
+        logger.error(f"Failed to queue document: {str(e)}")
+        logger.exception(e)
+        raise HTTPException(
+            status_code=500,
+            detail=f"Failed to queue document: {str(e)}"
+        )
+
+
+@app.post(
     "/api/v1/process",
     response_model=ProcessDocumentResponse,
     tags=["Document Processing"],
@@ -733,6 +873,26 @@ async def process_document(
         False,
         description="Whether to return debug information",
         example=False,
+    ),
+    webhook_url: Optional[str] = Form(
+        None,
+        description="Webhook URL to call when processing is complete (optional)",
+        example="http://host.docker.internal:3000/api/webhooks/rag-anything/callback",
+    ),
+    document_id: Optional[str] = Form(
+        None,
+        description="Client document ID (required if webhook_url is provided)",
+        example="doc-123",
+    ),
+    project_id: Optional[str] = Form(
+        None,
+        description="Client project ID (required if webhook_url is provided)",
+        example="project-123",
+    ),
+    session_id: Optional[str] = Form(
+        None,
+        description="Session ID for document processing (optional)",
+        example="session-123",
     ),
 ):
     """
@@ -912,6 +1072,23 @@ async def process_document(
         logger.info(f"   - Markdown length: {len(markdown)} chars")
         logger.info(f"   - Doc ID: {doc_id}")
         
+        # Send webhook callback if webhook_url is provided
+        if webhook_url:
+            if not document_id or not project_id:
+                logger.warning("webhook_url provided but document_id or project_id is missing. Skipping webhook.")
+            else:
+                # Send webhook asynchronously in background
+                asyncio.create_task(send_webhook_callback(
+                    webhook_url=webhook_url,
+                    doc_id=doc_id,
+                    document_id=document_id,
+                    project_id=project_id,
+                    status="completed",
+                    markdown=markdown,
+                    content_list=content_list,
+                ))
+                logger.info(f"Webhook callback scheduled for document: {document_id}")
+        
         response_data = {
             "success": True,
             "markdown": markdown,
@@ -926,6 +1103,19 @@ async def process_document(
     except Exception as e:
         logger.error(f"❌ Error processing document: {str(e)}")
         logger.exception(e)
+        
+        # Send webhook callback for failure if webhook_url is provided
+        if webhook_url and document_id and project_id:
+            asyncio.create_task(send_webhook_callback(
+                webhook_url=webhook_url,
+                doc_id="",  # No doc_id on failure
+                document_id=document_id,
+                project_id=project_id,
+                status="failed",
+                error=str(e),
+            ))
+            logger.info(f"Webhook callback scheduled for failed document: {document_id}")
+        
         return ProcessDocumentResponse(
             success=False,
             markdown="",

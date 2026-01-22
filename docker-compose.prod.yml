@@ -4,6 +4,35 @@ version: "3.8"
 # This configuration is optimized for production deployment
 
 services:
+  redis:
+    image: redis:7-alpine
+    container_name: rag-anything-redis-prod
+    restart: always
+    volumes:
+      - redis_data_prod:/data
+    networks:
+      - web_proxy
+    command: redis-server --appendonly yes
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "50m"
+        max-file: "5"
+        compress: "true"
+    deploy:
+      resources:
+        limits:
+          cpus: "${REDIS_CPU_LIMIT:-0.5}"
+          memory: "${REDIS_MEMORY_LIMIT:-512M}"
+        reservations:
+          cpus: "${REDIS_CPU_RESERVATION:-0.1}"
+          memory: "${REDIS_MEMORY_RESERVATION:-128M}"
+
   rag-anything-api:
     build:
       context: .
@@ -17,8 +46,19 @@ services:
       - NODE_ENV=production
       - ENABLE_ACME=true
       - VIRTUAL_HOST=${VIRTUAL_HOST:-}
+      # Redis Configuration (for message queue)
+      - REDIS_HOST=redis
+      - REDIS_PORT=6379
+      - REDIS_DB=${REDIS_DB:-0}
+      - REDIS_PASSWORD=${REDIS_PASSWORD:-}
+
+      # Queue Configuration
+      - MAX_CONCURRENT_FILES=${MAX_CONCURRENT_FILES:-1}
     env_file:
       - .env
+    depends_on:
+      redis:
+        condition: service_healthy
     volumes:
       - ./output:/app/output
       - ./rag_storage:/app/rag_storage
@@ -26,14 +66,22 @@ services:
       - rag_models_cache:/root/.cache
     networks:
       - web_proxy
+    # Resource limits - adjust based on your system
+    # For systems with 2 CPUs, these values are set conservatively
+    # For systems with more CPUs, you can increase the limits
+    # To check available CPUs: nproc (Linux) or sysctl -n hw.ncpu (macOS)
     deploy:
       resources:
         limits:
-          cpus: "4.0"
-          memory: 8G
+          # CPU limit: use 90% of available CPUs (max 1.8 for 2 CPU system)
+          # For 4+ CPU systems, you can increase to "3.5" or "4.0"
+          cpus: "${CPU_LIMIT:-1.8}"
+          memory: "${MEMORY_LIMIT:-8G}"
         reservations:
-          cpus: "2.0"
-          memory: 4G
+          # Minimum CPU reservation: 25% of available (0.5 for 2 CPU system)
+          # For 4+ CPU systems, you can increase to "1.0" or "2.0"
+          cpus: "${CPU_RESERVATION:-0.5}"
+          memory: "${MEMORY_RESERVATION:-2G}"
     healthcheck:
       test:
         [
@@ -54,8 +102,54 @@ services:
         max-file: "5"
         compress: "true"
 
+  rag-anything-worker:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: rag-anything-worker-prod
+    image: rag-anything-api:latest
+    restart: always
+    command: ["python", "start_worker.py"]
+    env_file:
+      - .env
+    environment:
+      # Redis Configuration (for message queue)
+      - REDIS_HOST=redis
+      - REDIS_PORT=6379
+      - REDIS_DB=${REDIS_DB:-0}
+      - REDIS_PASSWORD=${REDIS_PASSWORD:-}
+
+      # Queue Configuration
+      - MAX_CONCURRENT_FILES=${MAX_CONCURRENT_FILES:-1}
+    volumes:
+      - ./output:/app/output
+      - ./rag_storage:/app/rag_storage
+      - ./logs:/app/logs
+      - rag_models_cache:/root/.cache
+    networks:
+      - web_proxy
+    depends_on:
+      redis:
+        condition: service_healthy
+    deploy:
+      resources:
+        limits:
+          cpus: "${WORKER_CPU_LIMIT:-1.8}"
+          memory: "${WORKER_MEMORY_LIMIT:-8G}"
+        reservations:
+          cpus: "${WORKER_CPU_RESERVATION:-0.5}"
+          memory: "${WORKER_MEMORY_RESERVATION:-2G}"
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "100m"
+        max-file: "5"
+        compress: "true"
+
 volumes:
   rag_models_cache:
+    driver: local
+  redis_data_prod:
     driver: local
 
 networks:

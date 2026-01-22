@@ -5,6 +5,11 @@ lightrag-hku
 mineru[core]
 # Progress bars for batch processing
 tqdm
+# HTTP client for webhook callbacks
+httpx>=0.24.0
+# Message queue for document processing
+redis>=5.0.0
+rq>=1.15.0
 # Note: Optional dependencies are now defined in setup.py extras_require:
 # - [image]: Pillow>=10.0.0 (for BMP, TIFF, GIF, WebP format conversion)
 # - [text]: reportlab>=4.0.0 (for TXT, MD to PDF conversion)

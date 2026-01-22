@@ -1,170 +1,187 @@
+version: '3.8'
+
+# Local development Docker Compose configuration
+# Includes Redis and Worker for local testing
+
 services:
+  redis:
+    image: redis:7-alpine
+    container_name: rag-anything-redis-local
+    restart: unless-stopped
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis_data_local:/data
+    networks:
+      - rag-network
+    command: redis-server --appendonly yes
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
   rag-anything-api:
     build:
       context: .
       dockerfile: Dockerfile
     container_name: rag-anything-api-local
-    image: rag-anything-api:local
+    image: rag-anything-api:latest
     restart: unless-stopped
-
+    
     ports:
-      - "${PORT:-8000}:8000" # API port (configurable via .env)
-
+      - "8000:8000"
+    
     environment:
-      # ============================================
       # Server Configuration
-      # ============================================
       - HOST=0.0.0.0
       - PORT=8000
-
-      # ============================================
+      
       # RAG-Anything Configuration
-      # ============================================
       - PARSER=${PARSER:-mineru}
       - PARSE_METHOD=${PARSE_METHOD:-auto}
       - OUTPUT_DIR=/app/output
       - WORKING_DIR=/app/rag_storage
-      - DISPLAY_CONTENT_STATS=${DISPLAY_CONTENT_STATS:-true}
-
-      # ============================================
+      - DISPLAY_CONTENT_STATS=true
+      
       # Multimodal Processing
-      # ============================================
-      - ENABLE_IMAGE_PROCESSING=${ENABLE_IMAGE_PROCESSING:-true}
-      - ENABLE_TABLE_PROCESSING=${ENABLE_TABLE_PROCESSING:-true}
-      - ENABLE_EQUATION_PROCESSING=${ENABLE_EQUATION_PROCESSING:-true}
-
-      # ============================================
-      # LLM Configuration (optional for local dev)
-      # ============================================
-      # Note: For document parsing only, LLM is not strictly required.
-      # It's only needed for full RAG functionality (queries, summaries).
+      - ENABLE_IMAGE_PROCESSING=true
+      - ENABLE_TABLE_PROCESSING=true
+      - ENABLE_EQUATION_PROCESSING=true
+      
+      # LLM Configuration
       - LLM_BINDING=${LLM_BINDING:-openai}
       - LLM_MODEL=${LLM_MODEL:-gpt-4o-mini}
       - LLM_BINDING_HOST=${LLM_BINDING_HOST:-https://api.openai.com/v1}
-      - LLM_BINDING_API_KEY=${LLM_BINDING_API_KEY:-}
-
-      # ============================================
-      # Embedding Configuration (optional for local dev)
-      # ============================================
-      # Note: For document parsing only, embedding is not required.
-      # It's only needed for RAG query functionality.
+      - LLM_BINDING_API_KEY=${LLM_BINDING_API_KEY}
+      
+      # Embedding Configuration
       - EMBEDDING_BINDING=${EMBEDDING_BINDING:-openai}
       - EMBEDDING_MODEL=${EMBEDDING_MODEL:-text-embedding-3-large}
       - EMBEDDING_DIM=${EMBEDDING_DIM:-3072}
-      - EMBEDDING_BINDING_API_KEY=${EMBEDDING_BINDING_API_KEY:-}
-
-      # ============================================
-      # Alternative: OpenAI Direct Configuration
-      # ============================================
-      - OPENAI_API_KEY=${OPENAI_API_KEY:-}
-      - OPENAI_BASE_URL=${OPENAI_BASE_URL:-}
-
-      # ============================================
-      # macOS Specific Configuration
-      # ============================================
-      # Device selection for macOS:
-      # - cpu: Use CPU (most reliable, works on all Macs)
-      # - mps: Use Metal Performance Shaders (Apple Silicon only, experimental)
-      # Note: MPS support may be limited, CPU is more reliable
-      - DEVICE=${DEVICE:-cpu}
-
-      # ============================================
-      # Logging Configuration
-      # ============================================
+      - EMBEDDING_BINDING_API_KEY=${EMBEDDING_BINDING_API_KEY}
+      
+      # Optional: OpenAI API key
+      - OPENAI_API_KEY=${OPENAI_API_KEY}
+      - OPENAI_BASE_URL=${OPENAI_BASE_URL}
+      
+      # LightRAG Configuration
+      - ENABLE_LIGHTRAG=${ENABLE_LIGHTRAG:-true}
+      
+      # Logging
       - LOG_LEVEL=${LOG_LEVEL:-INFO}
       - VERBOSE=${VERBOSE:-false}
       - LOG_DIR=/app/logs
-
-      # ============================================
-      # Development Mode
-      # ============================================
-      - PYTHONUNBUFFERED=1
-      - PYTHONDONTWRITEBYTECODE=1
-
+      
+      # Redis Configuration (for message queue)
+      - REDIS_HOST=redis
+      - REDIS_PORT=6379
+      - REDIS_DB=${REDIS_DB:-0}
+      - REDIS_PASSWORD=${REDIS_PASSWORD:-}
+      
+      # Queue Configuration
+      - MAX_CONCURRENT_FILES=${MAX_CONCURRENT_FILES:-1}
+      
+    depends_on:
+      redis:
+        condition: service_healthy
+      
     volumes:
-      # ============================================
-      # Data Directories (mounted for easy access)
-      # ============================================
+      # Persist output and storage
       - ./output:/app/output
       - ./rag_storage:/app/rag_storage
       - ./logs:/app/logs
-
-      # ============================================
-      # Source Code Mounting (for development)
-      # ============================================
-      # Uncomment the following lines to enable live code reloading during development.
-      # Note: This allows you to modify code without rebuilding the container.
-      # Warning: Some changes may still require container restart.
-      # - ./raganything:/app/raganything:ro
-      # - ./api_server.py:/app/api_server.py:ro
-
-      # ============================================
-      # Cache Volumes
-      # ============================================
-      # Cache models to avoid re-downloading on container restarts
+      
+      # Optional: Mount models cache to avoid re-downloading
       - rag_models_cache:/root/.cache
-
-      # macOS specific: Use named volume for better performance
-      # This helps with I/O performance on macOS Docker Desktop
-      - rag_temp:/tmp
-
+      
     networks:
-      - rag-network-local
-
+      - rag-network
+    
     healthcheck:
-      # Health check using Python standard library (more reliable than requests)
-      # Alternative: Use curl if available: ["CMD", "curl", "-f", "http://localhost:8000/health"]
-      test:
-        [
-          "CMD",
-          "python",
-          "-c",
-          "import urllib.request; urllib.request.urlopen('http://localhost:8000/health').read()",
-        ]
+      test: ["CMD", "python", "-c", "import requests; requests.get('http://localhost:8000/health')"]
       interval: 30s
       timeout: 10s
       retries: 3
-      start_period: 60s # Increased for local dev (allows more time for initial startup)
+      start_period: 40s
 
-    logging:
-      driver: "json-file"
-      options:
-        max-size: "100m" # Increased to match production config
-        max-file: "3"
+  rag-anything-worker:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: rag-anything-worker-local
+    image: rag-anything-api:latest
+    restart: unless-stopped
+    command: ["python", "start_worker.py"]
+    
+    environment:
+      # RAG-Anything Configuration
+      - PARSER=${PARSER:-mineru}
+      - PARSE_METHOD=${PARSE_METHOD:-auto}
+      - OUTPUT_DIR=/app/output
+      - WORKING_DIR=/app/rag_storage
+      - DISPLAY_CONTENT_STATS=true
+      
+      # Multimodal Processing
+      - ENABLE_IMAGE_PROCESSING=true
+      - ENABLE_TABLE_PROCESSING=true
+      - ENABLE_EQUATION_PROCESSING=true
+      
+      # LLM Configuration
+      - LLM_BINDING=${LLM_BINDING:-openai}
+      - LLM_MODEL=${LLM_MODEL:-gpt-4o-mini}
+      - LLM_BINDING_HOST=${LLM_BINDING_HOST:-https://api.openai.com/v1}
+      - LLM_BINDING_API_KEY=${LLM_BINDING_API_KEY}
+      
+      # Embedding Configuration
+      - EMBEDDING_BINDING=${EMBEDDING_BINDING:-openai}
+      - EMBEDDING_MODEL=${EMBEDDING_MODEL:-text-embedding-3-large}
+      - EMBEDDING_DIM=${EMBEDDING_DIM:-3072}
+      - EMBEDDING_BINDING_API_KEY=${EMBEDDING_BINDING_API_KEY}
+      
+      # Optional: OpenAI API key
+      - OPENAI_API_KEY=${OPENAI_API_KEY}
+      - OPENAI_BASE_URL=${OPENAI_BASE_URL}
+      
+      # LightRAG Configuration
+      - ENABLE_LIGHTRAG=${ENABLE_LIGHTRAG:-true}
+      
+      # Logging
+      - LOG_LEVEL=${LOG_LEVEL:-INFO}
+      - VERBOSE=${VERBOSE:-false}
+      - LOG_DIR=/app/logs
+      
+      # Redis Configuration (for message queue)
+      - REDIS_HOST=redis
+      - REDIS_PORT=6379
+      - REDIS_DB=${REDIS_DB:-0}
+      - REDIS_PASSWORD=${REDIS_PASSWORD:-}
+      
+      # Queue Configuration
+      - MAX_CONCURRENT_FILES=${MAX_CONCURRENT_FILES:-1}
+    
+    volumes:
+      # Persist output and storage
+      - ./output:/app/output
+      - ./rag_storage:/app/rag_storage
+      - ./logs:/app/logs
+      
+      # Optional: Mount models cache to avoid re-downloading
+      - rag_models_cache:/root/.cache
+      
+    networks:
+      - rag-network
+    
+    depends_on:
+      redis:
+        condition: service_healthy
 
-    # ============================================
-    # Resource Limits (macOS Docker Desktop)
-    # ============================================
-    # Note: Docker Desktop for macOS runs in a VM, so these limits are approximate.
-    # Adjust based on your Mac's resources and Docker Desktop settings.
-    # To view/change Docker Desktop resources: Docker Desktop > Settings > Resources
-    deploy:
-      resources:
-        limits:
-          cpus: "4.0" # Adjust based on your Mac's CPU cores (check with: sysctl -n hw.ncpu)
-          memory: 8G # Adjust based on your Mac's RAM (recommended: 50-70% of total RAM)
-        reservations:
-          cpus: "2.0" # Minimum CPU allocation
-          memory: 4G # Minimum memory allocation
-
-# ============================================
-# Volumes
-# ============================================
 volumes:
-  # Persistent cache for downloaded models
   rag_models_cache:
     driver: local
-    name: rag-anything-models-cache-local
-
-  # Temporary files volume (better I/O performance on macOS)
-  rag_temp:
+  redis_data_local:
     driver: local
-    name: rag-anything-temp-local
 
-# ============================================
-# Networks
-# ============================================
 networks:
-  rag-network-local:
+  rag-network:
     driver: bridge
-    name: rag-anything-local
