@@ -770,6 +770,8 @@ class MineruParser(Parser):
 
             if return_code != 0 or error_lines:
                 cls.logger.info("[MinerU] Command executed failed")
+                if return_code == -9:
+                    error_lines = error_lines or ["Process killed by SIGKILL (OOM or system resource limit)"]
                 raise MineruExecutionError(return_code, error_lines)
             else:
                 cls.logger.info("[MinerU] Command executed successfully")

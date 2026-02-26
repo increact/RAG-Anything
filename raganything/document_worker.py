@@ -32,16 +32,17 @@ async def process_document_task_async(task_data: Dict[str, Any]) -> Dict[str, An
     Returns:
         Dict with processing results
     """
-    task_id = task_data["task_id"]
-    document_id = task_data["document_id"]
-    project_id = task_data["project_id"]
-    webhook_url = task_data["webhook_url"]
-    s3_url = task_data["s3_url"]
-    processing_options = task_data["processing_options"]
-    
+    task_id = task_data.get("task_id", "unknown")
+    document_id = task_data.get("document_id", "")
+    project_id = task_data.get("project_id", "")
+    webhook_url = task_data.get("webhook_url", "")
+
     temp_file = None
-    
+
     try:
+        s3_url = task_data["s3_url"]
+        processing_options = task_data["processing_options"]
+
         logger.info(f"Processing task {task_id} for document {document_id}")
         
         if rag_instance is None:
@@ -160,25 +161,28 @@ async def process_document_task_async(task_data: Dict[str, Any]) -> Dict[str, An
         logger.exception(e)
         
         # Send failure webhook
-        try:
-            from raganything.webhook_service import WebhookService
-            
-            # Fix webhook URL for Docker networking
-            fixed_webhook_url = webhook_url.replace("localhost", "host.docker.internal")
-            if fixed_webhook_url != webhook_url:
-                logger.info(f"Fixed webhook URL for Docker: {webhook_url} -> {fixed_webhook_url}")
-            
-            await WebhookService.send_webhook_with_retry(
-                webhook_url=fixed_webhook_url,
-                doc_id="",
-                document_id=document_id,
-                project_id=project_id,
-                status="failed",
-                error=str(e),
-                max_retries=3,
-            )
-        except Exception as webhook_error:
-            logger.error(f"Failed to send failure webhook: {webhook_error}")
+        if webhook_url:
+            try:
+                from raganything.webhook_service import WebhookService
+
+                # Fix webhook URL for Docker networking
+                fixed_webhook_url = webhook_url.replace("localhost", "host.docker.internal")
+                if fixed_webhook_url != webhook_url:
+                    logger.info(f"Fixed webhook URL for Docker: {webhook_url} -> {fixed_webhook_url}")
+
+                await WebhookService.send_webhook_with_retry(
+                    webhook_url=fixed_webhook_url,
+                    doc_id="",
+                    document_id=document_id,
+                    project_id=project_id,
+                    status="failed",
+                    error=str(e),
+                    max_retries=3,
+                )
+            except Exception as webhook_error:
+                logger.error(f"Failed to send failure webhook: {webhook_error}")
+        else:
+            logger.warning(f"No webhook_url for task {task_id}, skipping failure webhook")
         
         # Re-raise exception to mark task as failed
         raise

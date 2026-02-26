@@ -28,7 +28,7 @@ services:
       resources:
         limits:
           cpus: "${REDIS_CPU_LIMIT:-0.5}"
-          memory: "${REDIS_MEMORY_LIMIT:-512M}"
+          memory: "${REDIS_MEMORY_LIMIT:-256M}"
         reservations:
           cpus: "${REDIS_CPU_RESERVATION:-0.1}"
           memory: "${REDIS_MEMORY_RESERVATION:-128M}"
@@ -66,22 +66,14 @@ services:
       - rag_models_cache:/root/.cache
     networks:
       - web_proxy
-    # Resource limits - adjust based on your system
-    # For systems with 2 CPUs, these values are set conservatively
-    # For systems with more CPUs, you can increase the limits
-    # To check available CPUs: nproc (Linux) or sysctl -n hw.ncpu (macOS)
     deploy:
       resources:
         limits:
-          # CPU limit: use 90% of available CPUs (max 1.8 for 2 CPU system)
-          # For 4+ CPU systems, you can increase to "3.5" or "4.0"
-          cpus: "${CPU_LIMIT:-1.8}"
-          memory: "${MEMORY_LIMIT:-8G}"
+          cpus: "${CPU_LIMIT:-1.0}"
+          memory: "${MEMORY_LIMIT:-1.5G}"
         reservations:
-          # Minimum CPU reservation: 25% of available (0.5 for 2 CPU system)
-          # For 4+ CPU systems, you can increase to "1.0" or "2.0"
           cpus: "${CPU_RESERVATION:-0.5}"
-          memory: "${MEMORY_RESERVATION:-2G}"
+          memory: "${MEMORY_RESERVATION:-512M}"
     healthcheck:
       test:
         [
@@ -121,6 +113,15 @@ services:
 
       # Queue Configuration
       - MAX_CONCURRENT_FILES=${MAX_CONCURRENT_FILES:-1}
+
+      # Memory optimisation: limit ML framework thread pools
+      # Each extra thread allocates its own memory buffers; on 8GB EC2 this adds up fast
+      - OMP_NUM_THREADS=${OMP_NUM_THREADS:-1}
+      - MKL_NUM_THREADS=${MKL_NUM_THREADS:-1}
+      - OPENBLAS_NUM_THREADS=${OPENBLAS_NUM_THREADS:-1}
+      - TOKENIZERS_PARALLELISM=${TOKENIZERS_PARALLELISM:-false}
+      # Force malloc to release freed memory back to OS immediately
+      - MALLOC_TRIM_THRESHOLD_=${MALLOC_TRIM_THRESHOLD_:-100000}
     volumes:
       - ./output:/app/output
       - ./rag_storage:/app/rag_storage
@@ -134,10 +135,10 @@ services:
     deploy:
       resources:
         limits:
-          cpus: "${WORKER_CPU_LIMIT:-1.8}"
-          memory: "${WORKER_MEMORY_LIMIT:-8G}"
+          cpus: "${WORKER_CPU_LIMIT:-3.5}"
+          memory: "${WORKER_MEMORY_LIMIT:-5G}"
         reservations:
-          cpus: "${WORKER_CPU_RESERVATION:-0.5}"
+          cpus: "${WORKER_CPU_RESERVATION:-1.0}"
           memory: "${WORKER_MEMORY_RESERVATION:-2G}"
     logging:
       driver: "json-file"
