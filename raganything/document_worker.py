@@ -113,7 +113,7 @@ async def process_document_task_async(task_data: Dict[str, Any]) -> Dict[str, An
         
         logger.info(f"Document parsed successfully, doc_id: {doc_id}")
         
-        # Read markdown
+        # Read markdown output (written by the parser to the output dir)
         file_stem = Path(temp_file).stem
         md_file = Path(output_dir) / f"{file_stem}.md"
         markdown = ""
@@ -121,13 +121,44 @@ async def process_document_task_async(task_data: Dict[str, Any]) -> Dict[str, An
             with open(md_file, "r", encoding="utf-8") as f:
                 markdown = f.read()
         
+        # Build basic metadata counts
+        metadata: dict = {
+            "parser": selected_parser,
+            "parse_method": parse_method,
+            "doc_id": doc_id,
+            "tables": 0,
+            "formulas": 0,
+            "images": 0,
+        }
+        for item in content_list:
+            if isinstance(item, dict):
+                t = item.get("type", "")
+                if t == "table":
+                    metadata["tables"] += 1
+                elif t == "equation":
+                    metadata["formulas"] += 1
+                elif t == "image":
+                    metadata["images"] += 1
+
+        # Persist result to disk so GET /api/v1/result/{doc_id} can serve it
+        from raganything.result_store import save_result
+        save_result(
+            output_dir=output_dir,
+            doc_id=doc_id,
+            document_id=document_id,
+            project_id=project_id,
+            markdown=markdown,
+            content_list=content_list,
+            metadata=metadata,
+        )
+
         # Fix webhook URL for Docker networking
-        # Replace localhost with host.docker.internal to allow container to reach host
         fixed_webhook_url = webhook_url.replace("localhost", "host.docker.internal")
         if fixed_webhook_url != webhook_url:
             logger.info(f"Fixed webhook URL for Docker: {webhook_url} -> {fixed_webhook_url}")
         
-        # Send webhook (with retry)
+        # Send a lightweight notification webhook — no content payload.
+        # The receiver fetches the full result via GET /api/v1/result/{doc_id}.
         from raganything.webhook_service import WebhookService
         
         webhook_success = await WebhookService.send_webhook_with_retry(
@@ -136,18 +167,14 @@ async def process_document_task_async(task_data: Dict[str, Any]) -> Dict[str, An
             document_id=document_id,
             project_id=project_id,
             status="completed",
-            markdown=markdown,
-            content_list=content_list,
             max_retries=3,
         )
         
         if not webhook_success:
             logger.warning(
                 f"⚠️ Webhook failed for task {task_id} but document processing succeeded. "
-                f"Document ID: {doc_id}. Client can fetch results via API."
+                f"Document ID: {doc_id}. Client can fetch results via GET /api/v1/result/{doc_id}."
             )
-            # Don't raise exception - document processing succeeded
-            # Just log the webhook failure
         
         return {
             "success": True,

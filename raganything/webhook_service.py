@@ -1,10 +1,13 @@
 """
-Webhook service with retry mechanism for sending callbacks to client
+Webhook service with retry mechanism for sending callbacks to client.
+
+Design: webhooks carry only a lightweight notification (status + IDs).
+Full processing results are served via GET /api/v1/result/{doc_id}.
 """
 import asyncio
 import httpx
 from datetime import datetime, timezone
-from typing import Optional, Dict, Any, List
+from typing import Optional
 import logging
 
 logger = logging.getLogger(__name__)
@@ -12,7 +15,7 @@ logger = logging.getLogger(__name__)
 
 class WebhookService:
     """Webhook sending service (with retry mechanism)"""
-    
+
     @staticmethod
     async def send_webhook_with_retry(
         webhook_url: str,
@@ -21,26 +24,25 @@ class WebhookService:
         project_id: str,
         status: str,
         error: Optional[str] = None,
-        markdown: Optional[str] = None,
-        content_list: Optional[List[Dict[str, Any]]] = None,
         max_retries: int = 3,
     ) -> bool:
         """
-        Send webhook callback (with retry mechanism)
-        
+        Send a lightweight status-notification webhook (with exponential-backoff retry).
+
+        The payload intentionally omits the processed content (markdown / content_list).
+        Receivers should call GET /api/v1/result/{doc_id} to fetch the full result.
+
         Args:
-            webhook_url: Webhook URL to send to
-            doc_id: RAG Anything document ID
-            document_id: Client document ID
-            project_id: Client project ID
-            status: Processing status ('completed' or 'failed')
-            error: Error message if status is 'failed'
-            markdown: Markdown content if status is 'completed' (optional)
-            content_list: Content list if status is 'completed' (optional)
-            max_retries: Maximum number of retry attempts (default: 3)
-        
+            webhook_url:  Destination URL.
+            doc_id:       RAG-Anything document ID.
+            document_id:  Caller-supplied document identifier.
+            project_id:   Caller-supplied project identifier.
+            status:       "completed" or "failed".
+            error:        Human-readable error message when status is "failed".
+            max_retries:  Maximum delivery attempts (default 3).
+
         Returns:
-            bool: True if successful, False if all retries failed
+            True if delivered successfully, False if all attempts failed.
         """
         payload = {
             "docId": doc_id,
@@ -49,24 +51,17 @@ class WebhookService:
             "status": status,
             "timestamp": datetime.now(timezone.utc).isoformat(),
         }
-        
+
         if error:
             payload["error"] = error
-        
-        if status == "completed" and (markdown or content_list):
-            payload["metadata"] = {}
-            if markdown:
-                payload["metadata"]["markdown"] = markdown
-            if content_list:
-                payload["metadata"]["contentList"] = content_list
-        
+
         for attempt in range(max_retries):
             try:
                 logger.info(
                     f"Sending webhook to {webhook_url} for document {document_id} "
-                    f"(attempt {attempt + 1}/{max_retries})"
+                    f"(attempt {attempt + 1}/{max_retries}, status={status})"
                 )
-                
+
                 async with httpx.AsyncClient(timeout=30.0) as client:
                     response = await client.post(
                         webhook_url,
@@ -74,31 +69,29 @@ class WebhookService:
                         headers={"Content-Type": "application/json"},
                     )
                     response.raise_for_status()
-                    logger.info(f"✅ Webhook sent successfully for document {document_id}")
-                    return True  # Success
-                
+                    logger.info(f"✅ Webhook delivered for document {document_id}")
+                    return True
+
             except httpx.HTTPError as e:
+                wait = 2 ** attempt  # 1s, 2s, 4s
                 if attempt < max_retries - 1:
-                    wait_time = 2 ** attempt  # Exponential backoff: 1s, 2s, 4s
                     logger.warning(
-                        f"Webhook attempt {attempt + 1} failed for document {document_id}: {str(e)}. "
-                        f"Retrying in {wait_time}s..."
+                        f"Webhook attempt {attempt + 1} failed for {document_id}: {e}. "
+                        f"Retrying in {wait}s…"
                     )
-                    await asyncio.sleep(wait_time)
+                    await asyncio.sleep(wait)
                 else:
                     logger.error(
-                        f"❌ Failed to send webhook for document {document_id} after {max_retries} attempts: {str(e)}"
+                        f"❌ Webhook failed for {document_id} after {max_retries} attempts: {e}"
                     )
                     return False
+
             except Exception as e:
-                logger.error(
-                    f"❌ Unexpected error sending webhook for document {document_id}: {str(e)}"
-                )
+                logger.error(f"❌ Unexpected webhook error for {document_id}: {e}")
                 logger.exception(e)
                 if attempt < max_retries - 1:
                     await asyncio.sleep(2 ** attempt)
                 else:
                     return False
-        
-        return False
 
+        return False
