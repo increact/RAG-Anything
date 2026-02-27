@@ -288,10 +288,35 @@ async def lifespan(app: FastAPI):
     except Exception as e:
         logger.warning(f"⚠️ Could not initialize document queue (Redis may not be running): {e}")
         document_queue = None
-    
+
+    # Start background output-directory cleanup task
+    output_dir = os.getenv("OUTPUT_DIR", "./output")
+    ttl_days = int(os.getenv("OUTPUT_FILE_TTL_DAYS", "7"))
+    interval_hours = float(os.getenv("OUTPUT_CLEANUP_INTERVAL_HOURS", "24"))
+
+    from raganything.cleanup import run_cleanup_loop
+    cleanup_task = asyncio.create_task(
+        run_cleanup_loop(
+            output_dir=output_dir,
+            ttl_days=ttl_days,
+            interval_hours=interval_hours,
+            initial_delay_seconds=60.0,
+        )
+    )
+    logger.info(
+        f"✅ Output cleanup task started "
+        f"(ttl={ttl_days}d, interval={interval_hours}h)"
+    )
+
     yield
-    
-    # Shutdown: Cleanup
+
+    # Shutdown: cancel the cleanup loop first, then release other resources
+    cleanup_task.cancel()
+    try:
+        await cleanup_task
+    except asyncio.CancelledError:
+        pass
+
     logger.info("Shutting down RAG-Anything service...")
     rag_instance = None
     document_queue = None
