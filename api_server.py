@@ -54,6 +54,12 @@ except ImportError:
 # Global RAG instance (will be initialized on startup)
 rag_instance: Optional[RAGAnything] = None
 
+# Semaphore to limit concurrent document processing (set in lifespan)
+processing_semaphore: Optional[asyncio.Semaphore] = None
+
+# Singleton queue service (set in lifespan)
+document_queue: Optional[Any] = None
+
 # API Key security configuration
 API_KEY_NAME = "X-API-Key"
 api_key_header = APIKeyHeader(name=API_KEY_NAME, auto_error=False)
@@ -100,7 +106,7 @@ async def verify_api_key(api_key: Optional[str] = Security(api_key_header)):
     return api_key
 
 
-async def send_webhook_callback(
+async def _send_webhook(
     webhook_url: str,
     doc_id: str,
     document_id: str,
@@ -110,55 +116,19 @@ async def send_webhook_callback(
     markdown: Optional[str] = None,
     content_list: Optional[List[Dict[str, Any]]] = None,
 ):
-    """
-    Send webhook callback to client when document processing is complete
-    
-    Args:
-        webhook_url: URL to send webhook to
-        doc_id: RAG Anything document ID
-        document_id: Client document ID
-        project_id: Client project ID
-        status: Processing status ('completed' or 'failed')
-        error: Error message if status is 'failed'
-        markdown: Markdown content if status is 'completed' (optional, can be fetched via API)
-        content_list: Content list if status is 'completed' (optional, can be fetched via API)
-    """
-    try:
-        payload = {
-            "docId": doc_id,
-            "documentId": document_id,
-            "projectId": project_id,
-            "status": status,
-        }
-        
-        if error:
-            payload["error"] = error
-        
-        # Include metadata if available (optional, client can fetch via API)
-        if status == "completed" and (markdown or content_list):
-            payload["metadata"] = {}
-            if markdown:
-                payload["metadata"]["markdown"] = markdown
-            if content_list:
-                payload["metadata"]["contentList"] = content_list
-        
-        logger.info(f"Sending webhook to {webhook_url} for document {document_id} (status: {status})")
-        
-        async with httpx.AsyncClient(timeout=30.0) as client:
-            response = await client.post(
-                webhook_url,
-                json=payload,
-                headers={"Content-Type": "application/json"},
-            )
-            response.raise_for_status()
-            logger.info(f"✅ Webhook sent successfully for document {document_id}")
-    
-    except httpx.HTTPError as e:
-        logger.error(f"❌ Failed to send webhook for document {document_id}: {str(e)}")
-        # Don't raise - webhook failure shouldn't affect the main response
-    except Exception as e:
-        logger.error(f"❌ Unexpected error sending webhook for document {document_id}: {str(e)}")
-        logger.exception(e)
+    """Fire-and-forget webhook helper that delegates to WebhookService (includes retry)."""
+    from raganything.webhook_service import WebhookService
+    await WebhookService.send_webhook_with_retry(
+        webhook_url=webhook_url,
+        doc_id=doc_id,
+        document_id=document_id,
+        project_id=project_id,
+        status=status,
+        error=error,
+        markdown=markdown,
+        content_list=content_list,
+        max_retries=3,
+    )
 
 
 class ProcessDocumentRequest(BaseModel):
@@ -205,15 +175,21 @@ class HealthResponse(BaseModel):
     service: str = Field(..., description="Service name", example="rag-anything-api")
     rag_initialized: bool = Field(..., description="Whether RAG instance is initialized")
     lightrag_enabled: bool = Field(..., description="Whether LightRAG is enabled")
+    queue_available: bool = Field(False, description="Whether the document queue (Redis) is available")
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Lifespan context manager for FastAPI startup/shutdown"""
-    global rag_instance
+    global rag_instance, processing_semaphore, document_queue
     
     # Initialize document worker with RAG instance
     from raganything.document_worker import set_rag_instance
+    
+    # Set up processing semaphore based on MAX_CONCURRENT_FILES
+    max_concurrent = int(os.getenv("MAX_CONCURRENT_FILES", "1"))
+    processing_semaphore = asyncio.Semaphore(max_concurrent)
+    logger.info(f"Processing semaphore initialized with max_concurrent={max_concurrent}")
     
     # Check if LightRAG is enabled
     enable_lightrag = os.getenv("ENABLE_LIGHTRAG", "true").lower() in ("true", "1", "yes")
@@ -305,11 +281,22 @@ async def lifespan(app: FastAPI):
         logger.exception(e)
         # Continue anyway - will fail on first request
     
+    # Initialize queue service singleton (avoids creating a new Redis connection
+    # per request inside queue_document)
+    try:
+        from raganything.mq_service import DocumentProcessingQueue
+        document_queue = DocumentProcessingQueue()
+        logger.info("✅ Document queue service initialized")
+    except Exception as e:
+        logger.warning(f"⚠️ Could not initialize document queue (Redis may not be running): {e}")
+        document_queue = None
+    
     yield
     
     # Shutdown: Cleanup
     logger.info("Shutting down RAG-Anything service...")
     rag_instance = None
+    document_queue = None
 
 
 # Create FastAPI app
@@ -666,6 +653,7 @@ async def health_check():
         service="rag-anything-api",
         rag_initialized=rag_instance is not None,
         lightrag_enabled=enable_lightrag and (rag_instance is not None and rag_instance.lightrag is not None),
+        queue_available=document_queue is not None,
     )
 
 
@@ -690,7 +678,6 @@ async def queue_document(
     processing_options: str = Form(..., description="JSON string of processing options"),
 ):
     """Add document task to processing queue"""
-    from raganything.mq_service import DocumentProcessingQueue
     from datetime import datetime
     
     if rag_instance is None:
@@ -699,16 +686,19 @@ async def queue_document(
             detail="RAG-Anything service not initialized. Please check server logs."
         )
     
+    if document_queue is None:
+        raise HTTPException(
+            status_code=503,
+            detail="Document queue not available. Please check Redis connection.",
+        )
+    
     try:
         # Parse processing options
         options = json.loads(processing_options)
         task_id = f"task-{document_id}-{int(datetime.now().timestamp() * 1000)}"
         
-        # Create queue service
-        mq_service = DocumentProcessingQueue()
-        
         # Add task to queue
-        job_id = mq_service.add_task(
+        job_id = document_queue.add_task(
             task_id=task_id,
             document_id=document_id,
             project_id=project_id,
@@ -877,7 +867,7 @@ async def process_document(
     webhook_url: Optional[str] = Form(
         None,
         description="Webhook URL to call when processing is complete (optional)",
-        example="http://host.docker.internal:3000/api/webhooks/rag-anything/callback",
+        example="http://localhost:3000/api/webhooks/rag-anything/callback",
     ),
     document_id: Optional[str] = Form(
         None,
@@ -914,6 +904,14 @@ async def process_document(
         # Read file content
         file_content = await file.read()
         
+        # Enforce file size limit
+        max_mb = int(os.getenv("MAX_FILE_SIZE_MB", "500"))
+        if len(file_content) > max_mb * 1024 * 1024:
+            raise HTTPException(
+                status_code=413,
+                detail=f"File too large. Maximum allowed size is {max_mb} MB.",
+            )
+        
         # Create temporary file
         with tempfile.NamedTemporaryFile(delete=False, suffix=Path(file.filename).suffix) as tmp:
             tmp.write(file_content)
@@ -945,17 +943,17 @@ async def process_document(
         output_dir = os.getenv("OUTPUT_DIR", "./output")
         os.makedirs(output_dir, exist_ok=True)
         
-        # Update config with selected parser
-        rag_instance.config.parser = selected_parser
-        
-        # Parse document using RAG-Anything's parse_document method
-        content_list, doc_id = await rag_instance.parse_document(
-            temp_file,
-            output_dir,
-            parse_method,
-            display_stats=True,
-            **parser_kwargs,
-        )
+        # Acquire semaphore to honour MAX_CONCURRENT_FILES and prevent
+        # concurrent mutations of rag_instance.config.parser.
+        async with processing_semaphore:
+            rag_instance.config.parser = selected_parser
+            content_list, doc_id = await rag_instance.parse_document(
+                temp_file,
+                output_dir,
+                parse_method,
+                display_stats=True,
+                **parser_kwargs,
+            )
         
         logger.info(f"Parsed document: {len(content_list)} content blocks, doc_id: {doc_id}")
         
@@ -1077,8 +1075,7 @@ async def process_document(
             if not document_id or not project_id:
                 logger.warning("webhook_url provided but document_id or project_id is missing. Skipping webhook.")
             else:
-                # Send webhook asynchronously in background
-                asyncio.create_task(send_webhook_callback(
+                asyncio.create_task(_send_webhook(
                     webhook_url=webhook_url,
                     doc_id=doc_id,
                     document_id=document_id,
@@ -1106,9 +1103,9 @@ async def process_document(
         
         # Send webhook callback for failure if webhook_url is provided
         if webhook_url and document_id and project_id:
-            asyncio.create_task(send_webhook_callback(
+            asyncio.create_task(_send_webhook(
                 webhook_url=webhook_url,
-                doc_id="",  # No doc_id on failure
+                doc_id="",
                 document_id=document_id,
                 project_id=project_id,
                 status="failed",
@@ -1256,17 +1253,16 @@ async def process_document_stream(
                 "backend": backend,
             }
             
-            # Update config with selected parser
-            rag_instance.config.parser = selected_parser
-            
-            # Parse document using RAG-Anything
-            content_list, doc_id = await rag_instance.parse_document(
-                temp_file,
-                output_dir,
-                parse_method,
-                display_stats=True,
-                **parser_kwargs,
-            )
+            # Acquire semaphore to honour MAX_CONCURRENT_FILES
+            async with processing_semaphore:
+                rag_instance.config.parser = selected_parser
+                content_list, doc_id = await rag_instance.parse_document(
+                    temp_file,
+                    output_dir,
+                    parse_method,
+                    display_stats=True,
+                    **parser_kwargs,
+                )
             
             # Try to read markdown file first
             file_stem = Path(temp_file).stem

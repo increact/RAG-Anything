@@ -58,14 +58,24 @@ class DocumentProcessingQueue:
             "processing_options": processing_options,
         }
         
+        job_timeout = os.getenv("JOB_TIMEOUT", "7200")  # seconds; default 2 h
+        # Accept plain integers (seconds) or strings like "1h" / "2h"
+        try:
+            job_timeout = int(job_timeout)
+        except ValueError:
+            pass  # keep as string for rq to parse (e.g. "2h")
+
+        from raganything.document_worker import handle_job_failure
+
         job = self.queue.enqueue(
             "raganything.document_worker.process_document_task",
             task_data,
             job_id=task_id,
-            job_timeout="1h",  # 1 hour timeout
-            result_ttl=86400,  # Keep result for 24 hours
+            job_timeout=job_timeout,
+            result_ttl=86400,   # Keep result for 24 hours
             failure_ttl=86400,  # Keep failed jobs for 24 hours
-            retry=Retry(max=3),  # Retry up to 3 times
+            retry=Retry(max=3),
+            on_failure=handle_job_failure,
         )
         
         logger.info(f"Added task {task_id} to queue (job_id: {job.id})")

@@ -48,22 +48,21 @@ async def process_document_task_async(task_data: Dict[str, Any]) -> Dict[str, An
         if rag_instance is None:
             raise Exception("RAG instance not initialized")
         
-        # Download file from S3
-        logger.info(f"Downloading file from S3: {s3_url}")
-        async with httpx.AsyncClient(timeout=300.0) as client:
-            response = await client.get(s3_url)
-            response.raise_for_status()
-            file_content = response.content
-        
-        # Create temporary file
-        # Extract file extension from URL path (without query parameters)
+        # Extract file extension from URL path before downloading
         parsed_url = urlparse(s3_url)
         url_path = unquote(parsed_url.path)  # Decode URL encoding
         file_ext = Path(url_path).suffix or ".pdf"
-        
+
+        # Stream download directly to a temp file to avoid loading the
+        # entire file into memory (important for large documents).
+        logger.info(f"Downloading file from: {s3_url}")
         with tempfile.NamedTemporaryFile(delete=False, suffix=file_ext) as tmp:
-            tmp.write(file_content)
             temp_file = tmp.name
+            async with httpx.AsyncClient(timeout=300.0) as client:
+                async with client.stream("GET", s3_url) as response:
+                    response.raise_for_status()
+                    async for chunk in response.aiter_bytes(chunk_size=65536):
+                        tmp.write(chunk)
         
         logger.info(f"File saved to temporary location: {temp_file}")
         
@@ -159,32 +158,11 @@ async def process_document_task_async(task_data: Dict[str, Any]) -> Dict[str, An
     except Exception as e:
         logger.error(f"Error processing task {task_id}: {str(e)}")
         logger.exception(e)
-        
-        # Send failure webhook
-        if webhook_url:
-            try:
-                from raganything.webhook_service import WebhookService
-
-                # Fix webhook URL for Docker networking
-                fixed_webhook_url = webhook_url.replace("localhost", "host.docker.internal")
-                if fixed_webhook_url != webhook_url:
-                    logger.info(f"Fixed webhook URL for Docker: {webhook_url} -> {fixed_webhook_url}")
-
-                await WebhookService.send_webhook_with_retry(
-                    webhook_url=fixed_webhook_url,
-                    doc_id="",
-                    document_id=document_id,
-                    project_id=project_id,
-                    status="failed",
-                    error=str(e),
-                    max_retries=3,
-                )
-            except Exception as webhook_error:
-                logger.error(f"Failed to send failure webhook: {webhook_error}")
-        else:
-            logger.warning(f"No webhook_url for task {task_id}, skipping failure webhook")
-        
-        # Re-raise exception to mark task as failed
+        # Do NOT send the failure webhook here.
+        # With RQ Retry(max=3) the job can be retried up to 3 times; sending
+        # the webhook on every failed attempt would spam the client.
+        # handle_job_failure() is invoked by RQ once ALL retries are exhausted
+        # and is responsible for the single definitive failure notification.
         raise
     
     finally:
@@ -194,6 +172,57 @@ async def process_document_task_async(task_data: Dict[str, Any]) -> Dict[str, An
                 os.unlink(temp_file)
             except Exception as e:
                 logger.warning(f"Failed to delete temp file {temp_file}: {e}")
+
+
+def handle_job_failure(job, connection, type, value, traceback_obj):
+    """
+    RQ on_failure callback — called once when ALL retries are exhausted.
+
+    This is the single place that sends the failure webhook to the client,
+    regardless of whether the failure was a timeout or any other exception.
+    Keeping webhook delivery here avoids sending duplicate notifications when
+    the job is retried (Retry(max=3) would otherwise trigger the webhook on
+    every failed attempt).
+    """
+    try:
+        task_data = job.args[0] if job.args else {}
+        webhook_url = task_data.get("webhook_url", "")
+        document_id = task_data.get("document_id", "")
+        project_id = task_data.get("project_id", "")
+
+        if not webhook_url:
+            logger.warning(f"Job {job.id} failed but no webhook_url to notify")
+            return
+
+        error_msg = str(value) if value else "Unknown error"
+        logger.error(
+            f"Job {job.id} (document: {document_id}) permanently failed: {error_msg}. "
+            f"Sending failure webhook."
+        )
+
+        fixed_webhook_url = webhook_url.replace("localhost", "host.docker.internal")
+        if fixed_webhook_url != webhook_url:
+            logger.info(f"Fixed webhook URL for Docker: {webhook_url} -> {fixed_webhook_url}")
+
+        send_loop = asyncio.new_event_loop()
+        try:
+            from raganything.webhook_service import WebhookService
+            send_loop.run_until_complete(
+                WebhookService.send_webhook_with_retry(
+                    webhook_url=fixed_webhook_url,
+                    doc_id="",
+                    document_id=document_id,
+                    project_id=project_id,
+                    status="failed",
+                    error=error_msg,
+                    max_retries=3,
+                )
+            )
+        finally:
+            send_loop.close()
+
+    except Exception as e:
+        logger.error(f"handle_job_failure: failed to send failure webhook: {e}")
 
 
 def process_document_task(task_data: Dict[str, Any]) -> Dict[str, Any]:

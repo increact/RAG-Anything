@@ -3,6 +3,7 @@ Webhook service with retry mechanism for sending callbacks to client
 """
 import asyncio
 import httpx
+from datetime import datetime, timezone
 from typing import Optional, Dict, Any, List
 import logging
 
@@ -46,6 +47,7 @@ class WebhookService:
             "documentId": document_id,
             "projectId": project_id,
             "status": status,
+            "timestamp": datetime.now(timezone.utc).isoformat(),
         }
         
         if error:
