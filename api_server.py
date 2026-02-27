@@ -874,8 +874,8 @@ async def queue_document(
         options = json.loads(processing_options)
         task_id = f"task-{document_id}-{int(datetime.now().timestamp() * 1000)}"
         
-        # Add task to queue
-        job_id = document_queue.add_task(
+        # Add task to queue (returns existing job_id when duplicate is detected)
+        job_id, is_duplicate = document_queue.add_task(
             task_id=task_id,
             document_id=document_id,
             project_id=project_id,
@@ -884,12 +884,27 @@ async def queue_document(
             processing_options=options,
         )
         
+        if is_duplicate:
+            logger.info(
+                f"Duplicate submission ignored for document {document_id} "
+                f"(existing job: {job_id})"
+            )
+            return {
+                "success": True,
+                "task_id": job_id,
+                "job_id": job_id,
+                "duplicate": True,
+                "message": "Document is already queued or being processed. "
+                           "A webhook will be sent when the existing job completes.",
+            }
+
         logger.info(f"Queued document {document_id} for processing (task_id: {task_id}, job_id: {job_id})")
         
         return {
             "success": True,
             "task_id": task_id,
             "job_id": job_id,
+            "duplicate": False,
             "message": "Document queued for processing",
         }
     except json.JSONDecodeError as e:
