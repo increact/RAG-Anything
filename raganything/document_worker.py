@@ -71,21 +71,28 @@ async def process_document_task_async(task_data: Dict[str, Any]) -> Dict[str, An
         os.makedirs(output_dir, exist_ok=True)
         
         parser = processing_options.get("parser", "auto")
-        parse_method = processing_options.get("parseMethod", "auto")
+        parse_method = processing_options.get("parse_method", "auto")
         language = processing_options.get("language", "zh")
         device = processing_options.get("device", "cpu")
         
+        # formula/table detection each load a heavy ML model (~700MB-1GB each).
+        # Default to env-var controlled values so memory usage can be tuned at
+        # deployment time without changing caller code.
+        # Callers can always override per-request via processing_options.
+        formula_default = os.getenv("MINERU_FORMULA_DEFAULT", "false").lower() == "true"
+        table_default = os.getenv("MINERU_TABLE_DEFAULT", "false").lower() == "true"
+
         parser_kwargs = {
             "lang": language,
             "device": device,
-            "formula": processing_options.get("formula", True),
-            "table": processing_options.get("table", True),
+            "formula": processing_options.get("formula", formula_default),
+            "table": processing_options.get("table", table_default),
             "backend": processing_options.get("backend", "pipeline"),
         }
         
         # If session_id is provided, add to parser_kwargs
-        if "sessionId" in processing_options:
-            parser_kwargs["session_id"] = processing_options["sessionId"]
+        if "session_id" in processing_options:
+            parser_kwargs["session_id"] = processing_options["session_id"]
         
         # Auto-select parser
         if parser == "auto":

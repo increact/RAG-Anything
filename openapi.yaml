@@ -3,30 +3,36 @@ info:
   title: RAG-Anything API Server
   description: |
     RAG-Anything Document Processing API Service
-    
+
     This service provides powerful multimodal document parsing capabilities, supporting conversion of various document formats to Markdown.
-    
+
     ## Key Features
-    
+
     * **Multi-format Support**: PDF, Office documents (Word, PowerPoint, Excel), images, text files
     * **Intelligent Parsing**: Automatically extracts text, tables, formulas, and images
     * **Multiple Parsers**: Supports MinerU and Docling parsing engines
     * **GPU Acceleration**: Optional GPU acceleration to improve OCR and table extraction speed
     * **Streaming Processing**: Supports real-time streaming of processing results
-    
+    * **Async Queue Processing**: Queue documents for background processing with webhook callbacks
+    * **Result Persistence**: Retrieve full processing results anytime via doc_id
+
     ## Supported Document Formats
-    
+
     * **PDF**: Full support, including OCR, table, and formula extraction
     * **Office Documents**: DOC, DOCX, PPT, PPTX, XLS, XLSX (requires LibreOffice)
     * **Images**: JPG, PNG, BMP, TIFF, GIF, WebP (supports OCR)
     * **Text**: TXT, MD
-    
+
+    ## Authentication
+
+    Most endpoints require an `X-API-Key` header. If the `API_KEY` environment variable is not set on the server, authentication is disabled (development mode).
+
     ## Usage Instructions
-    
-    1. Upload document to `/api/v1/process` endpoint
-    2. Select parser and processing options
-    3. Get converted Markdown content
-    
+
+    1. Upload document to `/api/v1/process` for synchronous processing, or
+    2. Queue via `/api/v1/queue/document` for asynchronous processing with webhook notification
+    3. Retrieve full result anytime via `/api/v1/result/{doc_id}`
+
     For more information, please refer to: https://github.com/HKUDS/RAG-Anything
   version: 1.0.0
   contact:
@@ -42,11 +48,18 @@ servers:
   - url: https://api.example.com
     description: Production server (example)
 
+security:
+  - ApiKeyAuth: []
+
 tags:
   - name: Health
     description: Health check related endpoints
   - name: Document Processing
-    description: Document processing related endpoints
+    description: Synchronous and asynchronous document processing endpoints
+  - name: Result Retrieval
+    description: Retrieve full processing results by doc_id (designed for webhook receivers)
+  - name: Document Management
+    description: Browse processed document files, content lists, and layout data
 
 paths:
   /health:
@@ -55,13 +68,16 @@ paths:
         - Health
       summary: Health check
       description: |
-        Check if the service is running normally and if the RAG instance is initialized
-        
+        Check if the service is running normally and if the RAG instance is initialized.
+
         Returns the health status of the service, including:
         - Service status
         - Service name
         - RAG instance initialization status
+        - LightRAG enabled status
+        - Document queue (Redis) availability
       operationId: healthCheck
+      security: []
       responses:
         '200':
           description: Service running normally
@@ -73,6 +89,8 @@ paths:
                 status: healthy
                 service: rag-anything-api
                 rag_initialized: true
+                lightrag_enabled: false
+                queue_available: true
 
   /api/v1/process:
     post:
@@ -80,43 +98,53 @@ paths:
         - Document Processing
       summary: Process document and convert to Markdown
       description: |
-        Upload document and convert to Markdown format
-        
+        Upload a document and convert it to Markdown format synchronously.
+
         This endpoint receives file uploads, processes documents using RAG-Anything, and returns extracted Markdown content.
         Supports multiple document formats including PDF, Office documents, images, etc.
-        
+
         ## Processing Flow
-        
+
         1. Receive uploaded file
         2. Select parser based on file type (MinerU or Docling)
         3. Extract text, tables, formulas, images, etc.
         4. Convert to Markdown format
-        5. Return processing results and metadata
-        
+        5. Persist result to disk (accessible via `GET /api/v1/result/{doc_id}`)
+        6. Optionally send a webhook notification and return processing results and metadata
+
         ## Parameter Description
-        
+
         - **parser**: Parser selection
           - `auto`: Automatically select based on file type (recommended)
           - `mineru`: Use MinerU parser (suitable for PDF, images)
           - `docling`: Use Docling parser (suitable for Office documents)
-        
+
         - **parse_method**: Parse method
           - `auto`: Automatically select best method
           - `ocr`: Force OCR usage (suitable for scanned documents)
           - `txt`: Extract text only (fastest)
-        
+
         - **language**: Document language (for OCR optimization)
           - `zh`: Chinese
           - `en`: English
-          - Other language codes
-        
+          - Other ISO 639-1 language codes
+
         - **device**: Processing device
           - `cpu`: CPU processing (default)
           - `cuda:0`: GPU acceleration (requires NVIDIA GPU)
           - `mps`: Apple Silicon GPU
-        
+
         - **formula**: Whether to extract formulas (default: true)
         - **table**: Whether to extract tables (default: true)
+        - **backend**: Backend type (default: pipeline)
+          - `pipeline`: Standard pipeline
+          - `vlm-transformers`: Vision-language model backend
+
+        ## Webhook Notification
+
+        If `webhook_url`, `document_id`, and `project_id` are all provided, a lightweight
+        status notification will be sent to `webhook_url` upon completion. The caller
+        should then fetch the full result via `GET /api/v1/result/{doc_id}`.
       operationId: processDocument
       requestBody:
         required: true
@@ -144,7 +172,7 @@ paths:
                 language:
                   type: string
                   default: zh
-                  description: Document language (for OCR optimization)
+                  description: Document language code for OCR optimization (e.g. zh, en)
                 device:
                   type: string
                   enum: [cpu, cuda:0, mps]
@@ -160,11 +188,33 @@ paths:
                   description: Whether to extract tables
                 backend:
                   type: string
+                  enum: [pipeline, vlm-transformers]
                   default: pipeline
                   description: Backend type
+                debug:
+                  type: boolean
+                  default: false
+                  description: Return additional debug information in the response
+                webhook_url:
+                  type: string
+                  format: uri
+                  description: Webhook URL to notify when processing is complete (optional). Requires document_id and project_id.
+                  example: http://localhost:3000/api/webhooks/rag-anything/callback
+                document_id:
+                  type: string
+                  description: Caller-supplied document identifier (required if webhook_url is provided)
+                  example: doc-123
+                project_id:
+                  type: string
+                  description: Caller-supplied project identifier (required if webhook_url is provided)
+                  example: project-123
+                session_id:
+                  type: string
+                  description: Optional session identifier for document processing
+                  example: session-123
             encoding:
               file:
-                contentType: application/pdf, application/vnd.openxmlformats-officedocument.wordprocessingml.document, image/jpeg, image/png, etc.
+                contentType: application/pdf, application/vnd.openxmlformats-officedocument.wordprocessingml.document, image/jpeg, image/png
       responses:
         '200':
           description: Processing successful
@@ -176,14 +226,14 @@ paths:
                 success: true
                 markdown: |
                   # Document Title
-                  
+
                   This is the extracted content...
-                  
+
                   | Table | Data |
                   |-------|------|
                   | Col1  | Val1 |
                   | Col2  | Val2 |
-                  
+
                   $$E = mc^2$$
                 metadata:
                   parser: mineru
@@ -193,6 +243,7 @@ paths:
                   formulas: 5
                   images: 2
                 error: null
+                debug_info: null
         '400':
           description: Invalid request parameters
           content:
@@ -201,6 +252,18 @@ paths:
                 $ref: '#/components/schemas/ErrorResponse'
               example:
                 detail: Invalid file format or missing file
+        '413':
+          description: File too large
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+              example:
+                detail: File too large. Maximum allowed size is 500 MB.
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
         '503':
           description: Service not initialized
           content:
@@ -214,16 +277,16 @@ paths:
     post:
       tags:
         - Document Processing
-      summary: Stream document processing
+      summary: Stream document processing (SSE)
       description: |
-        Stream document processing and return Markdown fragments in real-time
-        
-        This endpoint uses Server-Sent Events (SSE) to return processing results in real-time, suitable for large documents and scenarios requiring real-time feedback.
-        
+        Stream document processing and return Markdown fragments in real-time via Server-Sent Events (SSE).
+
+        Suitable for large documents and scenarios requiring real-time feedback.
+
         ## Response Format
-        
-        Returns a stream in `text/event-stream` format, each data chunk starts with `data: `:
-        
+
+        Returns a stream in `text/event-stream` format. Each data chunk starts with `data: `:
+
         ```
         data: First segment content
 
@@ -237,9 +300,9 @@ paths:
 
         data: [DONE]
         ```
-        
+
         ## Error Handling
-        
+
         If an error occurs during processing, it returns:
         ```
         data: [ERROR] Error message
@@ -271,7 +334,7 @@ paths:
                 language:
                   type: string
                   default: zh
-                  description: Document language
+                  description: Document language code for OCR optimization
                 device:
                   type: string
                   enum: [cpu, cuda:0, mps]
@@ -287,20 +350,26 @@ paths:
                   description: Whether to extract tables
                 backend:
                   type: string
+                  enum: [pipeline, vlm-transformers]
                   default: pipeline
                   description: Backend type
       responses:
         '200':
-          description: Streaming response
+          description: Streaming SSE response
           content:
             text/event-stream:
               schema:
                 type: string
               example: |
-                data: Content fragment
+                data: # Document Title
+
+                data: First paragraph content
 
                 data: [DONE]
-
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
         '503':
           description: Service not initialized
           content:
@@ -308,7 +377,596 @@ paths:
               schema:
                 $ref: '#/components/schemas/ErrorResponse'
 
+  /api/v1/process-content-list:
+    post:
+      tags:
+        - Document Processing
+      summary: Process document and return structured content_list only
+      description: |
+        Upload a document and return only the structured `content_list` without generating Markdown.
+
+        This endpoint is optimized for structured indexing scenarios where Markdown output is not required.
+        It skips the Markdown conversion step for maximum processing speed.
+
+        ## Use Cases
+
+        - Pure indexing scenarios (no user viewing/editing needed)
+        - Batch processing large volumes of documents
+        - Scenarios requiring raw structured data for downstream processing
+
+        ## content_list Block Types
+
+        Each block in `content_list` has a `type` field:
+        - `text`: Text content with `text` and optional `text_level` and `page_idx` fields
+        - `table`: Table with `table_body` (Markdown) and optional `table_caption` fields
+        - `equation`: Math formula with `latex` field
+        - `image`: Image reference with `img_path` and optional `image_caption` fields
+      operationId: processDocumentContentList
+      requestBody:
+        required: true
+        content:
+          multipart/form-data:
+            schema:
+              type: object
+              required:
+                - file
+              properties:
+                file:
+                  type: string
+                  format: binary
+                  description: Document file to process
+                parser:
+                  type: string
+                  enum: [auto, mineru, docling]
+                  default: auto
+                  description: Parser selection
+                parse_method:
+                  type: string
+                  enum: [auto, ocr, txt]
+                  default: auto
+                  description: Parse method
+                language:
+                  type: string
+                  default: zh
+                  description: Document language code for OCR optimization
+                device:
+                  type: string
+                  enum: [cpu, cuda:0, mps]
+                  default: cpu
+                  description: Processing device
+                formula:
+                  type: boolean
+                  default: true
+                  description: Whether to extract formulas
+                table:
+                  type: boolean
+                  default: true
+                  description: Whether to extract tables
+                backend:
+                  type: string
+                  enum: [pipeline, vlm-transformers]
+                  default: pipeline
+                  description: Backend type
+      responses:
+        '200':
+          description: Processing successful
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ProcessContentListResponse'
+              example:
+                success: true
+                content_list:
+                  - type: text
+                    text: Document content...
+                    text_level: 1
+                    page_idx: 0
+                  - type: table
+                    table_body: "| Col1 | Col2 |\n|------|------|"
+                    table_caption:
+                      - Table 1
+                metadata:
+                  parser: mineru
+                  parse_method: auto
+                  doc_id: doc_123456
+                  tables: 3
+                  formulas: 5
+                  images: 2
+                error: null
+        '400':
+          description: Invalid request parameters or empty document
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+              example:
+                detail: Failed to extract content from document. The document may be empty or unsupported.
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '503':
+          description: Service not initialized
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+
+  /api/v1/queue/document:
+    post:
+      tags:
+        - Document Processing
+      summary: Queue document for asynchronous processing
+      description: |
+        Add a document task to the processing queue for asynchronous background processing.
+
+        The document will be downloaded from the provided S3 URL, processed by a background worker,
+        and a webhook notification will be sent to the specified `webhook_url` upon completion.
+
+        ## Duplicate Detection
+
+        If the same `document_id` is submitted while an existing job for it is still queued or
+        processing, the new request is ignored and the existing `job_id` is returned with
+        `"duplicate": true`. A webhook will still be sent when the existing job completes.
+
+        ## Webhook Payload
+
+        The webhook notification sent to `webhook_url` on completion is a lightweight status-only payload:
+        ```json
+        {
+          "docId": "a1b2c3...",
+          "documentId": "your-doc-id",
+          "projectId": "your-project-id",
+          "status": "completed",
+          "timestamp": "2026-02-27T12:00:00Z"
+        }
+        ```
+
+        The receiver should then call `GET /api/v1/result/{doc_id}` to retrieve the full result.
+
+        ## Prerequisites
+
+        Requires Redis to be running and the document queue to be available.
+        Returns `503` if Redis / the queue service is unavailable.
+      operationId: queueDocument
+      requestBody:
+        required: true
+        content:
+          multipart/form-data:
+            schema:
+              type: object
+              required:
+                - document_id
+                - project_id
+                - webhook_url
+                - s3_url
+                - processing_options
+              properties:
+                document_id:
+                  type: string
+                  description: Caller-supplied document identifier
+                  example: doc-123
+                project_id:
+                  type: string
+                  description: Caller-supplied project identifier
+                  example: project-456
+                webhook_url:
+                  type: string
+                  format: uri
+                  description: Webhook URL to call when processing is complete
+                  example: http://localhost:3000/api/webhooks/rag-anything/callback
+                s3_url:
+                  type: string
+                  format: uri
+                  description: S3-compatible URL of the document file to download and process
+                  example: https://s3.example.com/bucket/documents/report.pdf
+                processing_options:
+                  type: string
+                  description: |
+                    JSON string of processing options. Supported keys:
+                    `parser` (auto/mineru/docling), `parse_method` (auto/ocr/txt),
+                    `language`, `device`, `formula` (bool), `table` (bool), `backend`
+                  example: '{"parser":"auto","parse_method":"auto","language":"zh","device":"cpu","formula":true,"table":true}'
+      responses:
+        '200':
+          description: Document successfully queued (or duplicate detected)
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/QueueDocumentResponse'
+              examples:
+                queued:
+                  summary: New job queued
+                  value:
+                    success: true
+                    task_id: task-doc-123-1709030400000
+                    job_id: rq-job-abc123
+                    duplicate: false
+                    message: Document queued for processing
+                duplicate:
+                  summary: Duplicate submission
+                  value:
+                    success: true
+                    task_id: rq-job-abc123
+                    job_id: rq-job-abc123
+                    duplicate: true
+                    message: Document is already queued or being processed. A webhook will be sent when the existing job completes.
+        '400':
+          description: Invalid JSON in processing_options
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+              example:
+                detail: "Invalid JSON in processing_options: ..."
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '503':
+          description: Service not initialized or queue (Redis) unavailable
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+              example:
+                detail: Document queue not available. Please check Redis connection.
+
+  /api/v1/result/{doc_id}:
+    get:
+      tags:
+        - Result Retrieval
+      summary: Fetch full processing result by doc_id
+      description: |
+        Retrieve the complete processing result (Markdown + content_list) for a document
+        identified by its **doc_id**.
+
+        ## Intended usage
+
+        This endpoint is designed to be called by the **webhook receiver** after it receives
+        a completion notification. The notification webhook only carries a lightweight payload:
+
+        ```json
+        {
+          "docId": "a1b2c3...",
+          "documentId": "your-doc-id",
+          "projectId": "your-project-id",
+          "status": "completed",
+          "timestamp": "2026-02-27T12:00:00Z"
+        }
+        ```
+
+        The receiver should then call this endpoint to obtain the full result.
+
+        ## Result persistence
+
+        Results are stored on disk as `{output_dir}/{doc_id}_result.json` and are available
+        immediately after the webhook is sent. They persist until manually cleaned up or until
+        the optional output-directory TTL job removes them.
+
+        ## doc_id
+
+        The `doc_id` is a **content-based hash** generated by RAG-Anything after parsing.
+        It is included in:
+        - The webhook notification (`docId` field)
+        - The synchronous `/api/v1/process` response (`metadata.doc_id`)
+        - The queue endpoint's job result
+
+        ## Error codes
+
+        | Code | Meaning |
+        |------|---------|
+        | 200  | Result found and returned |
+        | 404  | No result found for this doc_id (not yet processed, or already cleaned up) |
+        | 503  | Service not initialised |
+      operationId: getResult
+      parameters:
+        - name: doc_id
+          in: path
+          required: true
+          description: Document ID (content-based hash) generated by RAG-Anything
+          schema:
+            type: string
+          example: a1b2c3d4e5f6789012345678
+      responses:
+        '200':
+          description: Result found and returned
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/DocumentResultResponse'
+              example:
+                success: true
+                doc_id: a1b2c3d4e5f6789012345678
+                document_id: my-document-001
+                project_id: my-project
+                processed_at: "2026-02-27T12:00:00+00:00"
+                metadata:
+                  parser: mineru
+                  parse_method: auto
+                  doc_id: a1b2c3d4e5f6789012345678
+                  tables: 3
+                  formulas: 2
+                  images: 5
+                markdown: "# Document Title\n\nFirst paragraph…"
+                content_list:
+                  - type: text
+                    text: Document Title
+                    text_level: 1
+                    page_idx: 0
+                  - type: table
+                    table_body: "| Col1 | Col2 |\n|---|---|"
+                    page_idx: 1
+        '404':
+          description: Result not found
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+              example:
+                detail: "Result not found for doc_id: a1b2c3d4. The document may not have been processed yet, or the result has expired."
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '500':
+          description: Failed to deserialise stored result
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+
+  /api/v1/doc/{doc_id}:
+    get:
+      tags:
+        - Document Management
+      summary: View document file information
+      description: |
+        View processed document file information by doc_id.
+
+        Returns basic file information for Markdown and content_list JSON files found in the
+        output directory. This is an informational endpoint; use `/api/v1/doc-content/{doc_id}`
+        to retrieve the actual Markdown content, or `/api/v1/result/{doc_id}` for the full result.
+
+        **Note**: The current implementation scans all files in the output directory rather than
+        filtering strictly by `doc_id`, so results reflect all files present at query time.
+      operationId: getDocumentById
+      parameters:
+        - name: doc_id
+          in: path
+          required: true
+          description: Document ID
+          schema:
+            type: string
+          example: a1b2c3d4e5f6
+      responses:
+        '200':
+          description: Document file information
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/DocumentInfoResponse'
+              example:
+                doc_id: a1b2c3d4e5f6
+                found_files:
+                  - type: markdown
+                    path: tmpXYZ/auto/tmpXYZ.md
+                    full_path: /app/output/tmpXYZ/auto/tmpXYZ.md
+                    size: 4096
+                  - type: content_list
+                    path: tmpXYZ/auto/tmpXYZ_content_list.json
+                    full_path: /app/output/tmpXYZ/auto/tmpXYZ_content_list.json
+                    items: 42
+                output_dir: ./output
+                note: Use /api/v1/doc-content/{doc_id} to get actual content, or directly access files in the output directory
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '500':
+          description: Internal server error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+
+  /api/v1/doc-content/{doc_id}:
+    get:
+      tags:
+        - Document Management
+      summary: Get the most recent document Markdown content
+      description: |
+        Get the complete Markdown content of a processed document by doc_id.
+
+        This endpoint searches the output directory for Markdown files and returns the content of
+        the **most recently modified** file. If no file is found, it returns 404.
+
+        **Note**: Because this endpoint returns the most recently modified file rather than
+        looking up a specific `doc_id`, it is intended as a convenience endpoint. For reliable
+        lookup by `doc_id`, use `GET /api/v1/result/{doc_id}` instead.
+      operationId: getDocumentContent
+      parameters:
+        - name: doc_id
+          in: path
+          required: true
+          description: Document ID (used as context; actual lookup is by most recent file)
+          schema:
+            type: string
+          example: a1b2c3d4e5f6
+      responses:
+        '200':
+          description: Markdown content returned
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/DocumentContentResponse'
+              example:
+                doc_id: a1b2c3d4e5f6
+                markdown: "# Document Title\n\nContent here..."
+                source_file: tmpXYZ/auto/tmpXYZ.md
+                length: 4096
+                note: Returns the most recently processed document content. If this is not what you want, please directly access files in the output directory.
+        '404':
+          description: No Markdown file found in output directory
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+              example:
+                detail: "Document content not found for doc_id: a1b2c3d4e5f6. Please check output directory: ./output"
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+
+  /api/v1/debug/content-list/{doc_id}:
+    get:
+      tags:
+        - Document Management
+      summary: "[Debug] View raw content_list"
+      description: |
+        Debug endpoint: View the raw `content_list` JSON data for the most recently processed document.
+
+        Returns the **first 10 items** of the most recently modified `*_content_list.json` file,
+        along with a summary of content type counts.
+
+        **Note**: This endpoint is intended for debugging purposes. It returns the most recent
+        file found, not a file strictly matched to the provided `doc_id`.
+      operationId: getContentList
+      parameters:
+        - name: doc_id
+          in: path
+          required: true
+          description: Document ID (used as context; actual lookup is by most recent file)
+          schema:
+            type: string
+          example: a1b2c3d4e5f6
+      responses:
+        '200':
+          description: content_list data (first 10 items)
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ContentListDebugResponse'
+              example:
+                doc_id: a1b2c3d4e5f6
+                source_file: tmpXYZ/auto/tmpXYZ_content_list.json
+                total_items: 42
+                content_types:
+                  text: 30
+                  table: 5
+                  equation: 3
+                  image: 4
+                content_list:
+                  - type: text
+                    text: "First paragraph..."
+                    page_idx: 0
+                note: Only showing first 10 items. For full content, please directly access the JSON file.
+        '404':
+          description: No content_list file found
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+              example:
+                detail: No content_list files found in ./output
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '500':
+          description: Failed to read or parse content_list file
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+
+  /api/v1/middle-json/{doc_id}:
+    get:
+      tags:
+        - Document Management
+      summary: Get document middle.json layout data
+      description: |
+        Get the `middle.json` layout file for a processed document by doc_id.
+
+        The `middle.json` file is generated by the MinerU parser and contains detailed layout
+        information including `preproc_blocks`, `lines`, `spans`, bounding boxes, and other
+        low-level parsing metadata.
+
+        **Note**: This endpoint returns the most recently modified `*_middle.json` file found
+        in the output directory, not a file strictly matched by `doc_id`. Only applicable
+        when MinerU is used as the parser.
+      operationId: getMiddleJson
+      parameters:
+        - name: doc_id
+          in: path
+          required: true
+          description: Document ID (used as context; actual lookup is by most recent file)
+          schema:
+            type: string
+          example: a1b2c3d4e5f6
+      responses:
+        '200':
+          description: middle.json data returned
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MiddleJsonResponse'
+              example:
+                doc_id: a1b2c3d4e5f6
+                source_file: tmpXYZ/auto/tmpXYZ_middle.json
+                middle_json:
+                  pdf_info:
+                    - page_idx: 0
+                      preproc_blocks: []
+        '404':
+          description: No middle.json file found
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+              example:
+                detail: No middle.json files found in ./output
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '500':
+          description: Failed to read or parse middle.json file
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+
 components:
+  securitySchemes:
+    ApiKeyAuth:
+      type: apiKey
+      in: header
+      name: X-API-Key
+      description: |
+        API key for authenticating requests. Set the `API_KEY` environment variable on the server
+        to enable authentication. If `API_KEY` is not configured, authentication is disabled
+        (development mode) and this header is not required.
+
+  responses:
+    Unauthorized:
+      description: API key is missing
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorResponse'
+          example:
+            detail: API key is required. Please provide X-API-Key header.
+    Forbidden:
+      description: Invalid API key
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorResponse'
+          example:
+            detail: Invalid API key
+
   schemas:
     HealthResponse:
       type: object
@@ -316,6 +974,8 @@ components:
         - status
         - service
         - rag_initialized
+        - lightrag_enabled
+        - queue_available
       properties:
         status:
           type: string
@@ -327,7 +987,15 @@ components:
           example: rag-anything-api
         rag_initialized:
           type: boolean
-          description: Whether RAG instance is initialized
+          description: Whether the RAG instance is initialized
+          example: true
+        lightrag_enabled:
+          type: boolean
+          description: Whether LightRAG is enabled and initialized
+          example: false
+        queue_available:
+          type: boolean
+          description: Whether the document queue (Redis) is available
           example: true
 
     DocumentMetadata:
@@ -350,8 +1018,8 @@ components:
           example: auto
         doc_id:
           type: string
-          description: Document ID
-          example: doc_123456
+          description: Document ID (content-based hash)
+          example: a1b2c3d4e5f6789012345678
         tables:
           type: integer
           description: Number of tables extracted
@@ -365,6 +1033,42 @@ components:
           description: Number of images extracted
           example: 2
 
+    ResultMetadata:
+      type: object
+      description: Metadata about a processed document, as stored in the result record
+      required:
+        - parser
+        - parse_method
+        - doc_id
+        - tables
+        - formulas
+        - images
+      properties:
+        parser:
+          type: string
+          description: Parser used (mineru or docling)
+          example: mineru
+        parse_method:
+          type: string
+          description: Parse method used (auto, ocr, txt)
+          example: auto
+        doc_id:
+          type: string
+          description: RAG-Anything document ID
+          example: a1b2c3d4e5f6789012345678
+        tables:
+          type: integer
+          description: Number of tables extracted
+          example: 3
+        formulas:
+          type: integer
+          description: Number of formulas extracted
+          example: 2
+        images:
+          type: integer
+          description: Number of images extracted
+          example: 5
+
     ProcessDocumentResponse:
       type: object
       required:
@@ -377,23 +1081,236 @@ components:
           example: true
         markdown:
           type: string
-          description: Converted Markdown content
-          example: |
-            # Document Title
-            
-            This is the extracted content...
-            
-            | Table | Data |
-            |-------|------|
-            | Col1  | Val1 |
+          description: Converted Markdown content (empty string on failure)
+          example: "# Document Title\n\nThis is the extracted content..."
         metadata:
           $ref: '#/components/schemas/DocumentMetadata'
-          description: Document metadata
         error:
           type: string
           nullable: true
-          description: Error message (if processing failed)
+          description: Error message if processing failed
           example: null
+        debug_info:
+          type: object
+          nullable: true
+          description: Debug information returned when `debug=true` is set in the request
+          additionalProperties: true
+          example: null
+
+    ProcessContentListResponse:
+      type: object
+      required:
+        - success
+      properties:
+        success:
+          type: boolean
+          description: Whether processing was successful
+          example: true
+        content_list:
+          type: array
+          nullable: true
+          description: |
+            Structured content blocks. Each block has a `type` field:
+            `text`, `table`, `equation`, or `image`, plus type-specific fields.
+          items:
+            type: object
+            additionalProperties: true
+        metadata:
+          $ref: '#/components/schemas/DocumentMetadata'
+        error:
+          type: string
+          nullable: true
+          description: Error message if processing failed
+          example: null
+
+    DocumentResultResponse:
+      type: object
+      description: Full processing result returned by GET /api/v1/result/{doc_id}
+      required:
+        - success
+        - doc_id
+        - document_id
+        - project_id
+        - processed_at
+        - metadata
+        - markdown
+        - content_list
+      properties:
+        success:
+          type: boolean
+          description: Whether the result was found and loaded
+          example: true
+        doc_id:
+          type: string
+          description: RAG-Anything document ID (content-based hash)
+          example: a1b2c3d4e5f6789012345678
+        document_id:
+          type: string
+          description: Caller-supplied document identifier
+          example: my-document-001
+        project_id:
+          type: string
+          description: Caller-supplied project identifier
+          example: my-project
+        processed_at:
+          type: string
+          format: date-time
+          description: ISO-8601 UTC timestamp of when processing completed
+          example: "2026-02-27T12:00:00+00:00"
+        metadata:
+          $ref: '#/components/schemas/ResultMetadata'
+        markdown:
+          type: string
+          description: Full Markdown content extracted from the document
+          example: "# Document Title\n\nFirst paragraph…"
+        content_list:
+          type: array
+          description: |
+            Structured content blocks. Each block has a `type` field:
+            `text`, `table`, `equation`, or `image`, plus type-specific fields.
+          items:
+            type: object
+            additionalProperties: true
+
+    QueueDocumentResponse:
+      type: object
+      required:
+        - success
+        - task_id
+        - job_id
+        - duplicate
+        - message
+      properties:
+        success:
+          type: boolean
+          description: Whether the task was accepted (true even for duplicates)
+          example: true
+        task_id:
+          type: string
+          description: Task identifier (equals job_id for duplicate submissions)
+          example: task-doc-123-1709030400000
+        job_id:
+          type: string
+          description: Underlying queue job identifier
+          example: rq-job-abc123
+        duplicate:
+          type: boolean
+          description: Whether this submission was detected as a duplicate of an existing job
+          example: false
+        message:
+          type: string
+          description: Human-readable status message
+          example: Document queued for processing
+
+    DocumentInfoResponse:
+      type: object
+      properties:
+        doc_id:
+          type: string
+          description: Requested document ID
+          example: a1b2c3d4e5f6
+        found_files:
+          type: array
+          description: List of files found in the output directory
+          items:
+            type: object
+            properties:
+              type:
+                type: string
+                enum: [markdown, content_list]
+                description: File type
+              path:
+                type: string
+                description: Relative path from output directory
+              full_path:
+                type: string
+                description: Absolute file path
+              size:
+                type: integer
+                description: File size in characters (markdown files only)
+              items:
+                type: integer
+                description: Number of items (content_list files only)
+        output_dir:
+          type: string
+          description: Output directory path
+          example: ./output
+        note:
+          type: string
+          description: Usage guidance
+
+    DocumentContentResponse:
+      type: object
+      properties:
+        doc_id:
+          type: string
+          description: Requested document ID
+          example: a1b2c3d4e5f6
+        markdown:
+          type: string
+          description: Full Markdown content of the most recently processed document
+        source_file:
+          type: string
+          description: Relative path of the Markdown file that was read
+          example: tmpXYZ/auto/tmpXYZ.md
+        length:
+          type: integer
+          description: Length of the Markdown content in characters
+          example: 4096
+        note:
+          type: string
+          description: Usage guidance
+
+    ContentListDebugResponse:
+      type: object
+      properties:
+        doc_id:
+          type: string
+          description: Requested document ID
+          example: a1b2c3d4e5f6
+        source_file:
+          type: string
+          description: Relative path of the content_list JSON file that was read
+          example: tmpXYZ/auto/tmpXYZ_content_list.json
+        total_items:
+          type: integer
+          description: Total number of items in the full content_list
+          example: 42
+        content_types:
+          type: object
+          description: Count of each content block type
+          additionalProperties:
+            type: integer
+          example:
+            text: 30
+            table: 5
+            equation: 3
+            image: 4
+        content_list:
+          type: array
+          description: First 10 items of the content_list
+          items:
+            type: object
+            additionalProperties: true
+        note:
+          type: string
+          description: Reminder that only 10 items are shown
+
+    MiddleJsonResponse:
+      type: object
+      properties:
+        doc_id:
+          type: string
+          description: Requested document ID
+          example: a1b2c3d4e5f6
+        source_file:
+          type: string
+          description: Relative path of the middle.json file that was read
+          example: tmpXYZ/auto/tmpXYZ_middle.json
+        middle_json:
+          type: object
+          description: Full middle.json content (MinerU layout data)
+          additionalProperties: true
 
     ErrorResponse:
       type: object
@@ -402,4 +1319,3 @@ components:
           type: string
           description: Error details
           example: Error message here
-

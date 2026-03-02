@@ -101,6 +101,8 @@ services:
     container_name: rag-anything-worker-prod
     image: rag-anything-api:latest
     restart: always
+    mem_limit: ${WORKER_MEMORY_LIMIT:-5g}
+    memswap_limit: ${WORKER_MEMSWAP_LIMIT:-7g}
     command: ["python", "start_worker.py"]
     env_file:
       - .env
@@ -113,15 +115,19 @@ services:
 
       # Queue Configuration
       - MAX_CONCURRENT_FILES=${MAX_CONCURRENT_FILES:-1}
+      - JOB_TIMEOUT=${JOB_TIMEOUT:-7200}
 
       # Memory optimisation: limit ML framework thread pools
       # Each extra thread allocates its own memory buffers; on 8GB EC2 this adds up fast
-      - OMP_NUM_THREADS=${OMP_NUM_THREADS:-1}
-      - MKL_NUM_THREADS=${MKL_NUM_THREADS:-1}
-      - OPENBLAS_NUM_THREADS=${OPENBLAS_NUM_THREADS:-1}
+      - OMP_NUM_THREADS=${OMP_NUM_THREADS:-4}
+      - MKL_NUM_THREADS=${MKL_NUM_THREADS:-4}
+      - OPENBLAS_NUM_THREADS=${OPENBLAS_NUM_THREADS:-4}
       - TOKENIZERS_PARALLELISM=${TOKENIZERS_PARALLELISM:-false}
       # Force malloc to release freed memory back to OS immediately
       - MALLOC_TRIM_THRESHOLD_=${MALLOC_TRIM_THRESHOLD_:-100000}
+      # MinerU model defaults: disable heavy formula/table models unless explicitly requested
+      - MINERU_FORMULA_DEFAULT=${MINERU_FORMULA_DEFAULT:-false}
+      - MINERU_TABLE_DEFAULT=${MINERU_TABLE_DEFAULT:-true}
     volumes:
       - ./output:/app/output
       - ./rag_storage:/app/rag_storage
@@ -135,7 +141,7 @@ services:
     deploy:
       resources:
         limits:
-          cpus: "${WORKER_CPU_LIMIT:-3.5}"
+          cpus: "${WORKER_CPU_LIMIT:-3.0}"
           memory: "${WORKER_MEMORY_LIMIT:-5G}"
         reservations:
           cpus: "${WORKER_CPU_RESERVATION:-1.0}"
