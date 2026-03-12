@@ -129,6 +129,8 @@ services:
       # MinerU model defaults: disable heavy formula/table models unless explicitly requested
       - MINERU_FORMULA_DEFAULT=${MINERU_FORMULA_DEFAULT:-false}
       - MINERU_TABLE_DEFAULT=${MINERU_TABLE_DEFAULT:-true}
+      # Large PDFs are split into chunks of N pages to prevent MinerU process pool OOM
+      - MINERU_PAGES_PER_CHUNK=${MINERU_PAGES_PER_CHUNK:-10}
     volumes:
       - ./output:/app/output
       - ./rag_storage:/app/rag_storage

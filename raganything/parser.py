@@ -869,42 +869,66 @@ class MineruParser(Parser):
 
         return content_list, md_content
 
+    @staticmethod
+    def _get_pdf_page_count(pdf_path: Path) -> Optional[int]:
+        """Get total page count of a PDF using pdfinfo (poppler-utils)."""
+        try:
+            result = subprocess.run(
+                ["pdfinfo", str(pdf_path)],
+                capture_output=True, text=True, timeout=30,
+            )
+            for line in result.stdout.splitlines():
+                if line.startswith("Pages:"):
+                    return int(line.split(":")[1].strip())
+        except Exception:
+            pass
+        return None
+
+    @staticmethod
+    def _release_memory():
+        """Force Python GC and ask glibc to return freed memory to OS."""
+        import gc
+        gc.collect()
+        try:
+            import ctypes
+            libc = ctypes.CDLL("libc.so.6")
+            libc.malloc_trim(0)
+        except Exception:
+            pass
+
     def parse_pdf(
         self,
         pdf_path: Union[str, Path],
         output_dir: Optional[str] = None,
         method: str = "auto",
         lang: Optional[str] = None,
-        max_retries: int = 2,
         **kwargs,
     ) -> List[Dict[str, Any]]:
         """
-        Parse PDF document using MinerU 2.0
+        Parse PDF document using MinerU 2.0.
+
+        For large PDFs, automatically splits into page-range chunks to prevent
+        MinerU's internal process pool from OOM-killing workers.
 
         Args:
             pdf_path: Path to the PDF file
             output_dir: Output directory path
             method: Parsing method (auto, txt, ocr)
             lang: Document language for OCR optimization
-            max_retries: Maximum number of attempts (default 2: initial + 1 retry)
             **kwargs: Additional parameters for mineru command
 
         Returns:
             List[Dict[str, Any]]: List of content blocks
         """
-        import gc
         import shutil
-        import time
 
         try:
-            # Convert to Path object for easier handling
             pdf_path = Path(pdf_path)
             if not pdf_path.exists():
                 raise FileNotFoundError(f"PDF file does not exist: {pdf_path}")
 
             name_without_suff = pdf_path.stem
 
-            # Prepare output directory
             if output_dir:
                 base_output_dir = Path(output_dir)
             else:
@@ -915,49 +939,127 @@ class MineruParser(Parser):
             backend = kwargs.get("backend", "")
             read_method = "vlm" if backend.startswith("vlm-") else method
 
-            for attempt in range(1, max_retries + 1):
-                # Run mineru command
-                self._run_mineru_command(
-                    input_path=pdf_path,
-                    output_dir=base_output_dir,
-                    method=method,
-                    lang=lang,
-                    **kwargs,
+            # If caller already specified page range, respect it (no chunking).
+            if kwargs.get("start_page") is not None or kwargs.get("end_page") is not None:
+                return self._parse_pdf_single(
+                    pdf_path, base_output_dir, name_without_suff,
+                    method, read_method, lang, **kwargs,
                 )
 
-                # Read the generated output files
-                content_list, _ = self._read_output_files(
-                    base_output_dir, name_without_suff, method=read_method
+            # Determine page count to decide whether chunking is needed.
+            pages_per_chunk = int(__import__("os").environ.get("MINERU_PAGES_PER_CHUNK", "10"))
+            total_pages = self._get_pdf_page_count(pdf_path)
+
+            if total_pages is None or total_pages <= pages_per_chunk:
+                # Small PDF or unknown page count — process in one shot.
+                return self._parse_pdf_single(
+                    pdf_path, base_output_dir, name_without_suff,
+                    method, read_method, lang, **kwargs,
                 )
 
-                if content_list:
-                    return content_list
-
-                # No output produced — likely an internal OOM in MinerU's process pool.
-                if attempt < max_retries:
-                    self.logger.warning(
-                        f"[MinerU] Attempt {attempt}/{max_retries} produced no output. "
-                        f"Cleaning up and retrying after GC..."
-                    )
-                    # Remove stale output dir so MinerU starts fresh
-                    stale_dir = base_output_dir / name_without_suff
-                    if stale_dir.exists():
-                        shutil.rmtree(stale_dir, ignore_errors=True)
-                    # Force garbage collection to free memory before retry
-                    gc.collect()
-                    time.sleep(2)
-
-            # All attempts exhausted — return empty list and let caller decide
-            self.logger.error(
-                f"[MinerU] All {max_retries} attempts produced no output for {pdf_path}"
+            # --- Chunked processing for large PDFs ---
+            self.logger.info(
+                f"[MinerU] Large PDF detected ({total_pages} pages). "
+                f"Processing in chunks of {pages_per_chunk} pages."
             )
-            return content_list
+            all_content: List[Dict[str, Any]] = []
+
+            for chunk_start in range(0, total_pages, pages_per_chunk):
+                chunk_end = min(chunk_start + pages_per_chunk - 1, total_pages - 1)
+                chunk_output_dir = base_output_dir / f"_chunk_{chunk_start}_{chunk_end}"
+                chunk_output_dir.mkdir(parents=True, exist_ok=True)
+
+                self.logger.info(
+                    f"[MinerU] Processing pages {chunk_start}-{chunk_end} "
+                    f"({chunk_end - chunk_start + 1}/{total_pages} pages)"
+                )
+
+                chunk_kwargs = {**kwargs, "start_page": chunk_start, "end_page": chunk_end}
+                try:
+                    self._run_mineru_command(
+                        input_path=pdf_path,
+                        output_dir=chunk_output_dir,
+                        method=method,
+                        lang=lang,
+                        **chunk_kwargs,
+                    )
+
+                    chunk_content, _ = self._read_output_files(
+                        chunk_output_dir, name_without_suff, method=read_method
+                    )
+                    if chunk_content:
+                        all_content.extend(chunk_content)
+                        self.logger.info(
+                            f"[MinerU] Chunk pages {chunk_start}-{chunk_end}: "
+                            f"extracted {len(chunk_content)} blocks"
+                        )
+                    else:
+                        self.logger.warning(
+                            f"[MinerU] Chunk pages {chunk_start}-{chunk_end} produced no output"
+                        )
+                except MineruExecutionError as e:
+                    self.logger.error(
+                        f"[MinerU] Chunk pages {chunk_start}-{chunk_end} failed: {e}. "
+                        f"Skipping this chunk."
+                    )
+                finally:
+                    # Clean up chunk output and release memory between chunks
+                    shutil.rmtree(chunk_output_dir, ignore_errors=True)
+                    self._release_memory()
+
+            self.logger.info(
+                f"[MinerU] Chunked processing complete: {len(all_content)} total blocks "
+                f"from {total_pages} pages"
+            )
+            return all_content
 
         except MineruExecutionError:
             raise
         except Exception as e:
             self.logger.error(f"Error in parse_pdf: {str(e)}")
             raise
+
+    def _parse_pdf_single(
+        self,
+        pdf_path: Path,
+        base_output_dir: Path,
+        name_without_suff: str,
+        method: str,
+        read_method: str,
+        lang: Optional[str],
+        **kwargs,
+    ) -> List[Dict[str, Any]]:
+        """Parse a PDF (or page range) in a single MinerU invocation with one retry."""
+        import shutil
+
+        for attempt in range(1, 3):
+            self._run_mineru_command(
+                input_path=pdf_path,
+                output_dir=base_output_dir,
+                method=method,
+                lang=lang,
+                **kwargs,
+            )
+
+            content_list, _ = self._read_output_files(
+                base_output_dir, name_without_suff, method=read_method
+            )
+            if content_list:
+                return content_list
+
+            if attempt < 2:
+                self.logger.warning(
+                    "[MinerU] Produced no output, cleaning up and retrying..."
+                )
+                stale_dir = base_output_dir / name_without_suff
+                if stale_dir.exists():
+                    shutil.rmtree(stale_dir, ignore_errors=True)
+                self._release_memory()
+                import time
+                time.sleep(2)
+
+        self.logger.error(f"[MinerU] All attempts produced no output for {pdf_path}")
+        return []
 
     def parse_image(
         self,
