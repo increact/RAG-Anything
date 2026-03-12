@@ -103,6 +103,7 @@ services:
     restart: always
     mem_limit: ${WORKER_MEMORY_LIMIT:-13g}
     memswap_limit: ${WORKER_MEMSWAP_LIMIT:-14g}
+    shm_size: ${WORKER_SHM_SIZE:-2g}
     command: ["python", "start_worker.py"]
     env_file:
       - .env
@@ -118,10 +119,10 @@ services:
       - JOB_TIMEOUT=${JOB_TIMEOUT:-7200}
 
       # Memory optimisation: limit ML framework thread pools
-      # Each extra thread allocates its own memory buffers; on 8GB EC2 this adds up fast
-      - OMP_NUM_THREADS=${OMP_NUM_THREADS:-4}
-      - MKL_NUM_THREADS=${MKL_NUM_THREADS:-4}
-      - OPENBLAS_NUM_THREADS=${OPENBLAS_NUM_THREADS:-4}
+      # Each extra thread allocates its own memory buffers that multiply with MinerU's process pool
+      - OMP_NUM_THREADS=${OMP_NUM_THREADS:-2}
+      - MKL_NUM_THREADS=${MKL_NUM_THREADS:-2}
+      - OPENBLAS_NUM_THREADS=${OPENBLAS_NUM_THREADS:-2}
       - TOKENIZERS_PARALLELISM=${TOKENIZERS_PARALLELISM:-false}
       # Force malloc to release freed memory back to OS immediately
       - MALLOC_TRIM_THRESHOLD_=${MALLOC_TRIM_THRESHOLD_:-100000}

@@ -1,6 +1,7 @@
 """
 Document processing worker for handling queued tasks
 """
+import gc
 import os
 import asyncio
 import tempfile
@@ -207,6 +208,12 @@ async def process_document_task_async(task_data: Dict[str, Any]) -> Dict[str, An
             except Exception as e:
                 logger.warning(f"Failed to delete temp file {temp_file}: {e}")
 
+        # Release large objects and force garbage collection to prevent
+        # memory accumulation across successive jobs in this long-lived worker.
+        content_list = None  # noqa: F841
+        markdown = None  # noqa: F841
+        gc.collect()
+
 
 def handle_job_failure(job, connection, type, value, traceback_obj):
     """
@@ -262,10 +269,10 @@ def handle_job_failure(job, connection, type, value, traceback_obj):
 def process_document_task(task_data: Dict[str, Any]) -> Dict[str, Any]:
     """
     Synchronous wrapper for RQ worker
-    
+
     Args:
         task_data: Task data containing document_id, s3_url, processing_options, etc.
-    
+
     Returns:
         Dict with processing results
     """
@@ -276,4 +283,7 @@ def process_document_task(task_data: Dict[str, Any]) -> Dict[str, Any]:
         return loop.run_until_complete(process_document_task_async(task_data))
     finally:
         loop.close()
+        # Force GC after every job to reclaim memory from MinerU models,
+        # parsed content, and base64-encoded images before the next job.
+        gc.collect()
 

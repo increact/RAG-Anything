@@ -875,6 +875,7 @@ class MineruParser(Parser):
         output_dir: Optional[str] = None,
         method: str = "auto",
         lang: Optional[str] = None,
+        max_retries: int = 2,
         **kwargs,
     ) -> List[Dict[str, Any]]:
         """
@@ -885,11 +886,16 @@ class MineruParser(Parser):
             output_dir: Output directory path
             method: Parsing method (auto, txt, ocr)
             lang: Document language for OCR optimization
+            max_retries: Maximum number of attempts (default 2: initial + 1 retry)
             **kwargs: Additional parameters for mineru command
 
         Returns:
             List[Dict[str, Any]]: List of content blocks
         """
+        import gc
+        import shutil
+        import time
+
         try:
             # Convert to Path object for easier handling
             pdf_path = Path(pdf_path)
@@ -906,22 +912,44 @@ class MineruParser(Parser):
 
             base_output_dir.mkdir(parents=True, exist_ok=True)
 
-            # Run mineru command
-            self._run_mineru_command(
-                input_path=pdf_path,
-                output_dir=base_output_dir,
-                method=method,
-                lang=lang,
-                **kwargs,
-            )
-
-            # Read the generated output files
             backend = kwargs.get("backend", "")
-            if backend.startswith("vlm-"):
-                method = "vlm"
+            read_method = "vlm" if backend.startswith("vlm-") else method
 
-            content_list, _ = self._read_output_files(
-                base_output_dir, name_without_suff, method=method
+            for attempt in range(1, max_retries + 1):
+                # Run mineru command
+                self._run_mineru_command(
+                    input_path=pdf_path,
+                    output_dir=base_output_dir,
+                    method=method,
+                    lang=lang,
+                    **kwargs,
+                )
+
+                # Read the generated output files
+                content_list, _ = self._read_output_files(
+                    base_output_dir, name_without_suff, method=read_method
+                )
+
+                if content_list:
+                    return content_list
+
+                # No output produced — likely an internal OOM in MinerU's process pool.
+                if attempt < max_retries:
+                    self.logger.warning(
+                        f"[MinerU] Attempt {attempt}/{max_retries} produced no output. "
+                        f"Cleaning up and retrying after GC..."
+                    )
+                    # Remove stale output dir so MinerU starts fresh
+                    stale_dir = base_output_dir / name_without_suff
+                    if stale_dir.exists():
+                        shutil.rmtree(stale_dir, ignore_errors=True)
+                    # Force garbage collection to free memory before retry
+                    gc.collect()
+                    time.sleep(2)
+
+            # All attempts exhausted — return empty list and let caller decide
+            self.logger.error(
+                f"[MinerU] All {max_retries} attempts produced no output for {pdf_path}"
             )
             return content_list
 
