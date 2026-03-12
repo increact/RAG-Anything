@@ -101,8 +101,8 @@ services:
     container_name: rag-anything-worker-prod
     image: rag-anything-api:latest
     restart: always
-    mem_limit: ${WORKER_MEMORY_LIMIT:-5g}
-    memswap_limit: ${WORKER_MEMSWAP_LIMIT:-7g}
+    mem_limit: ${WORKER_MEMORY_LIMIT:-13g}
+    memswap_limit: ${WORKER_MEMSWAP_LIMIT:-14g}
     command: ["python", "start_worker.py"]
     env_file:
       - .env
@@ -141,11 +141,11 @@ services:
     deploy:
       resources:
         limits:
-          cpus: "${WORKER_CPU_LIMIT:-3.0}"
-          memory: "${WORKER_MEMORY_LIMIT:-5G}"
+          cpus: "${WORKER_CPU_LIMIT:-6.0}"
+          memory: "${WORKER_MEMORY_LIMIT:-13G}"
         reservations:
-          cpus: "${WORKER_CPU_RESERVATION:-1.0}"
-          memory: "${WORKER_MEMORY_RESERVATION:-2G}"
+          cpus: "${WORKER_CPU_RESERVATION:-2.0}"
+          memory: "${WORKER_MEMORY_RESERVATION:-4G}"
     logging:
       driver: "json-file"
       options:

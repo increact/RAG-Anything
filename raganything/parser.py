@@ -650,17 +650,34 @@ class MineruParser(Parser):
         if vlm_url:
             cmd.extend(["-u", vlm_url])
 
-        output_lines = []
         error_lines = []
 
         try:
             # Prepare subprocess parameters to hide console window on Windows
+            import os
             import platform
+            import time
             import threading
             from queue import Queue, Empty
 
             # Log the command being executed
             cls.logger.info(f"Executing mineru command: {' '.join(cmd)}")
+
+            # Inherit memory-limiting env vars so MinerU's internal
+            # process pool and ML frameworks stay within bounds.
+            sub_env = os.environ.copy()
+            for var in (
+                "OMP_NUM_THREADS",
+                "MKL_NUM_THREADS",
+                "OPENBLAS_NUM_THREADS",
+                "TOKENIZERS_PARALLELISM",
+                "MALLOC_TRIM_THRESHOLD_",
+            ):
+                if var in os.environ:
+                    sub_env[var] = os.environ[var]
+            # Limit MinerU's internal process pool to 1 worker to cap
+            # peak memory (each pool worker loads its own model copy).
+            sub_env.setdefault("MINERU_WORKERS", "1")
 
             subprocess_kwargs = {
                 "stdout": subprocess.PIPE,
@@ -669,6 +686,7 @@ class MineruParser(Parser):
                 "encoding": "utf-8",
                 "errors": "ignore",
                 "bufsize": 1,  # Line buffered
+                "env": sub_env,
             }
 
             # Hide console window on Windows
@@ -705,61 +723,45 @@ class MineruParser(Parser):
             stdout_thread.start()
             stderr_thread.start()
 
-            # Process output in real time
-            while process.poll() is None:
-                # Check stdout queue
+            def _drain_stderr(queue, error_lines):
+                """Drain stderr queue, logging and collecting error lines."""
                 try:
                     while True:
-                        prefix, line = stdout_queue.get_nowait()
-                        output_lines.append(line)
-                        # Log mineru output with INFO level, prefixed with [MinerU]
-                        cls.logger.info(f"[MinerU] {line}")
-                except Empty:
-                    pass
-
-                # Check stderr queue
-                try:
-                    while True:
-                        prefix, line = stderr_queue.get_nowait()
-                        # Log mineru errors with WARNING level
+                        _prefix, line = queue.get_nowait()
                         if "warning" in line.lower():
                             cls.logger.warning(f"[MinerU] {line}")
                         elif "error" in line.lower():
                             cls.logger.error(f"[MinerU] {line}")
-                            error_message = line.split("\n")[0]
-                            error_lines.append(error_message)
+                            error_lines.append(line.split("\n")[0])
                         else:
                             cls.logger.info(f"[MinerU] {line}")
                 except Empty:
                     pass
 
-                # Small delay to prevent busy waiting
-                import time
+            # Process output in real time
+            while process.poll() is None:
+                # Drain stdout – log only, don't accumulate
+                try:
+                    while True:
+                        _prefix, line = stdout_queue.get_nowait()
+                        cls.logger.info(f"[MinerU] {line}")
+                except Empty:
+                    pass
 
+                _drain_stderr(stderr_queue, error_lines)
+
+                # Small delay to prevent busy waiting
                 time.sleep(0.1)
 
             # Process any remaining output after process completion
             try:
                 while True:
-                    prefix, line = stdout_queue.get_nowait()
-                    output_lines.append(line)
+                    _prefix, line = stdout_queue.get_nowait()
                     cls.logger.info(f"[MinerU] {line}")
             except Empty:
                 pass
 
-            try:
-                while True:
-                    prefix, line = stderr_queue.get_nowait()
-                    if "warning" in line.lower():
-                        cls.logger.warning(f"[MinerU] {line}")
-                    elif "error" in line.lower():
-                        cls.logger.error(f"[MinerU] {line}")
-                        error_message = line.split("\n")[0]
-                        error_lines.append(error_message)
-                    else:
-                        cls.logger.info(f"[MinerU] {line}")
-            except Empty:
-                pass
+            _drain_stderr(stderr_queue, error_lines)
 
             # Wait for process to complete and get return code
             return_code = process.wait()
@@ -768,11 +770,18 @@ class MineruParser(Parser):
             stdout_thread.join(timeout=5)
             stderr_thread.join(timeout=5)
 
-            if return_code != 0 or error_lines:
+            if return_code != 0:
                 cls.logger.info("[MinerU] Command executed failed")
                 if return_code == -9:
                     error_lines = error_lines or ["Process killed by SIGKILL (OOM or system resource limit)"]
                 raise MineruExecutionError(return_code, error_lines)
+            elif error_lines:
+                # MinerU exited successfully but logged errors (e.g. an internal
+                # process-pool worker was OOM-killed and MinerU recovered).
+                # Treat as non-fatal – the output files may still be valid.
+                cls.logger.warning(
+                    f"[MinerU] Command succeeded (rc=0) but logged errors: {error_lines}"
+                )
             else:
                 cls.logger.info("[MinerU] Command executed successfully")
 
