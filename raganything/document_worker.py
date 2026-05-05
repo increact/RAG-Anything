@@ -90,11 +90,7 @@ async def process_document_task_async(task_data: Dict[str, Any]) -> Dict[str, An
             "table": processing_options.get("table", table_default),
             "backend": processing_options.get("backend", "pipeline"),
         }
-        
-        # If session_id is provided, add to parser_kwargs
-        if "session_id" in processing_options:
-            parser_kwargs["session_id"] = processing_options["session_id"]
-        
+
         # Auto-select parser
         if parser == "auto":
             file_ext = Path(temp_file).suffix.lower()
