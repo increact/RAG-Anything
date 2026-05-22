@@ -29,16 +29,18 @@ async def test_describe_image_returns_description(tmp_path):
     img.write_bytes(b"\x89PNG fake image bytes")
     calls = []
 
-    async def fake_vision(prompt, image_data=None, system_prompt=None, **kwargs):
+    async def fake_vision(prompt, image_data=None, system_prompt=None,
+                          image_mime=None, **kwargs):
         calls.append({"prompt": prompt, "image_data": image_data,
-                      "system_prompt": system_prompt})
+                      "system_prompt": system_prompt, "image_mime": image_mime})
         return "  A red square on a white background.  "
 
     result = await image_vlm.describe_image(str(img), fake_vision)
     assert result == "A red square on a white background."
     assert len(calls) == 1
-    assert calls[0]["image_data"]        # base64 string was passed
-    assert calls[0]["system_prompt"]     # system prompt was passed
+    assert calls[0]["image_data"]                   # base64 string was passed
+    assert calls[0]["system_prompt"]                # system prompt was passed
+    assert calls[0]["image_mime"] == "image/png"    # real MIME type, not jpeg
 
 
 async def test_describe_image_none_func_returns_empty(tmp_path):

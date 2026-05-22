@@ -6,6 +6,7 @@ upload paths to attach a natural-language description of an uploaded image to
 the parse result.
 """
 import logging
+import mimetypes
 import os
 from pathlib import Path
 
@@ -47,10 +48,14 @@ async def describe_image(image_path: str, vision_model_func) -> str:
     image_b64 = encode_image_to_base64(image_path)
     if not image_b64:
         return ""
+    # Use the real MIME type so non-JPEG images (PNG is the common case) are
+    # not mislabelled in the data URL — stricter VLM providers reject that.
+    mime_type = mimetypes.guess_type(image_path)[0] or "image/jpeg"
     try:
         result = await vision_model_func(
             _USER_PROMPT,
             image_data=image_b64,
+            image_mime=mime_type,
             system_prompt=_SYSTEM_PROMPT,
         )
         return (result or "").strip()
@@ -74,7 +79,8 @@ def build_vision_model_func():
     vision_model = os.getenv("VISION_MODEL", "openai/gpt-4o-mini")
 
     def vision_model_func(prompt, system_prompt=None, history_messages=None,
-                          image_data=None, messages=None, **kwargs):
+                          image_data=None, image_mime="image/jpeg",
+                          messages=None, **kwargs):
         # Lazy import so importing this module does not require lightrag.
         from lightrag.llm.openai import openai_complete_if_cache
 
@@ -93,7 +99,7 @@ def build_vision_model_func():
                 "content": [
                     {"type": "text", "text": prompt},
                     {"type": "image_url",
-                     "image_url": {"url": f"data:image/jpeg;base64,{image_data}"}},
+                     "image_url": {"url": f"data:{image_mime};base64,{image_data}"}},
                 ],
             })
             return openai_complete_if_cache(
