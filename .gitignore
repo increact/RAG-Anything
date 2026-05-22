@@ -70,6 +70,7 @@ tiktoken_cache/
 
 # unit-test files
 test_*
+!tests/test_*.py
 
 # Cline files
 memory-bank/
