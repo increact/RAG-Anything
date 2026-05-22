@@ -6,6 +6,7 @@ upload paths to attach a natural-language description of an uploaded image to
 the parse result.
 """
 import logging
+import os
 from pathlib import Path
 
 from raganything.utils import encode_image_to_base64
@@ -56,3 +57,54 @@ async def describe_image(image_path: str, vision_model_func) -> str:
     except Exception as e:
         logger.warning("VLM image description failed for %s: %s", image_path, e)
         return ""
+
+
+def build_vision_model_func():
+    """Build a vision_model_func for image VLM calls, or return None.
+
+    Returns None when VISION_BINDING_API_KEY is unset — the feature then stays
+    inert. The vision provider is configured independently of the main LLM and
+    defaults to OpenRouter.
+    """
+    vision_key = os.getenv("VISION_BINDING_API_KEY")
+    if not vision_key:
+        logger.info("VISION_BINDING_API_KEY not set — image VLM disabled")
+        return None
+    vision_host = os.getenv("VISION_BINDING_HOST", "https://openrouter.ai/api/v1")
+    vision_model = os.getenv("VISION_MODEL", "openai/gpt-4o-mini")
+
+    def vision_model_func(prompt, system_prompt=None, history_messages=None,
+                          image_data=None, messages=None, **kwargs):
+        # Lazy import so importing this module does not require lightrag.
+        from lightrag.llm.openai import openai_complete_if_cache
+
+        if messages:
+            return openai_complete_if_cache(
+                vision_model, "", system_prompt=None, history_messages=[],
+                messages=messages, api_key=vision_key, base_url=vision_host,
+                **kwargs,
+            )
+        if image_data:
+            msgs = []
+            if system_prompt:
+                msgs.append({"role": "system", "content": system_prompt})
+            msgs.append({
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": prompt},
+                    {"type": "image_url",
+                     "image_url": {"url": f"data:image/jpeg;base64,{image_data}"}},
+                ],
+            })
+            return openai_complete_if_cache(
+                vision_model, "", system_prompt=None, history_messages=[],
+                messages=msgs, api_key=vision_key, base_url=vision_host, **kwargs,
+            )
+        return openai_complete_if_cache(
+            vision_model, prompt, system_prompt=system_prompt,
+            history_messages=history_messages or [], api_key=vision_key,
+            base_url=vision_host, **kwargs,
+        )
+
+    logger.info("Image VLM enabled: model=%s host=%s", vision_model, vision_host)
+    return vision_model_func

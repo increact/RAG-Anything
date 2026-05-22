@@ -66,3 +66,14 @@ async def test_describe_image_oversized_returns_empty(tmp_path, monkeypatch):
         return "should not be reached"
 
     assert await image_vlm.describe_image(str(img), fake_vision) == ""
+
+
+def test_build_vision_model_func_none_without_key(monkeypatch):
+    monkeypatch.delenv("VISION_BINDING_API_KEY", raising=False)
+    assert image_vlm.build_vision_model_func() is None
+
+
+def test_build_vision_model_func_returns_callable_with_key(monkeypatch):
+    monkeypatch.setenv("VISION_BINDING_API_KEY", "test-key")
+    func = image_vlm.build_vision_model_func()
+    assert callable(func)
