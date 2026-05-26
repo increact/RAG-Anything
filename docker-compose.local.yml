@@ -8,6 +8,8 @@ services:
     image: redis:7-alpine
     container_name: rag-anything-redis-local
     restart: unless-stopped
+    # Bind to loopback only — otherwise an unauthenticated Redis is exposed
+    # on every network the host can reach.
     ports:
       - "6379:6379"
     volumes:
@@ -32,74 +34,56 @@ services:
     ports:
       - "8000:8000"
     
+    # User config (LLM/embedding/OpenAI keys, parser, logging) lives in .env —
+    # same source as docker-compose.prod.yml so the two files cannot drift.
+    # Only container wiring + structural flags are inlined below.
+    env_file:
+      - .env
     environment:
-      # Server Configuration
+      # Server / path wiring (in-container, not user config)
       - HOST=0.0.0.0
       - PORT=8000
-      
-      # RAG-Anything Configuration
-      - PARSER=${PARSER:-mineru}
-      - PARSE_METHOD=${PARSE_METHOD:-auto}
       - OUTPUT_DIR=/app/output
       - WORKING_DIR=/app/rag_storage
+      - LOG_DIR=/app/logs
       - DISPLAY_CONTENT_STATS=true
-      
+
       # Multimodal Processing
       - ENABLE_IMAGE_PROCESSING=true
       - ENABLE_TABLE_PROCESSING=true
       - ENABLE_EQUATION_PROCESSING=true
-      
-      # LLM Configuration
-      - LLM_BINDING=${LLM_BINDING:-openai}
-      - LLM_MODEL=${LLM_MODEL:-gpt-4o-mini}
-      - LLM_BINDING_HOST=${LLM_BINDING_HOST:-https://api.openai.com/v1}
-      - LLM_BINDING_API_KEY=${LLM_BINDING_API_KEY}
-      
-      # Embedding Configuration
-      - EMBEDDING_BINDING=${EMBEDDING_BINDING:-openai}
-      - EMBEDDING_MODEL=${EMBEDDING_MODEL:-text-embedding-3-large}
-      - EMBEDDING_DIM=${EMBEDDING_DIM:-3072}
-      - EMBEDDING_BINDING_API_KEY=${EMBEDDING_BINDING_API_KEY}
-      
-      # Optional: OpenAI API key
-      - OPENAI_API_KEY=${OPENAI_API_KEY}
-      - OPENAI_BASE_URL=${OPENAI_BASE_URL}
-      
-      # LightRAG Configuration
-      - ENABLE_LIGHTRAG=${ENABLE_LIGHTRAG:-true}
-      
-      # Logging
-      - LOG_LEVEL=${LOG_LEVEL:-INFO}
-      - VERBOSE=${VERBOSE:-false}
-      - LOG_DIR=/app/logs
-      
+
       # Redis Configuration (for message queue)
       - REDIS_HOST=redis
       - REDIS_PORT=6379
       - REDIS_DB=${REDIS_DB:-0}
       - REDIS_PASSWORD=${REDIS_PASSWORD:-}
-      
+
       # Queue Configuration
       - MAX_CONCURRENT_FILES=${MAX_CONCURRENT_FILES:-1}
-      
+
+      # Rewrite `localhost` in client-supplied webhook_url to
+      # `host.docker.internal` so callbacks reach services on the host.
+      - DOCKER_NETWORKING=${DOCKER_NETWORKING:-true}
+
     depends_on:
       redis:
         condition: service_healthy
-      
+
     volumes:
       # Persist output and storage
       - ./output:/app/output
       - ./rag_storage:/app/rag_storage
       - ./logs:/app/logs
-      
+
       # Optional: Mount models cache to avoid re-downloading
-      - rag_models_cache:/root/.cache
-      
+      - rag_models_cache:/home/appuser/.cache
+
     networks:
       - rag-network
-    
+
     healthcheck:
-      test: ["CMD", "python", "-c", "import requests; requests.get('http://localhost:8000/health')"]
+      test: ["CMD", "curl", "--fail", "--silent", "--max-time", "5", "http://localhost:8000/health"]
       interval: 30s
       timeout: 10s
       retries: 3
@@ -113,53 +97,35 @@ services:
     image: rag-anything-api:latest
     restart: unless-stopped
     command: ["python", "start_worker.py"]
-    
+
+    # User config lives in .env (shared with prod). Only wiring is inlined.
+    env_file:
+      - .env
     environment:
-      # RAG-Anything Configuration
-      - PARSER=${PARSER:-mineru}
-      - PARSE_METHOD=${PARSE_METHOD:-auto}
+      # Path wiring (in-container)
       - OUTPUT_DIR=/app/output
       - WORKING_DIR=/app/rag_storage
+      - LOG_DIR=/app/logs
       - DISPLAY_CONTENT_STATS=true
-      
+
       # Multimodal Processing
       - ENABLE_IMAGE_PROCESSING=true
       - ENABLE_TABLE_PROCESSING=true
       - ENABLE_EQUATION_PROCESSING=true
-      
-      # LLM Configuration
-      - LLM_BINDING=${LLM_BINDING:-openai}
-      - LLM_MODEL=${LLM_MODEL:-gpt-4o-mini}
-      - LLM_BINDING_HOST=${LLM_BINDING_HOST:-https://api.openai.com/v1}
-      - LLM_BINDING_API_KEY=${LLM_BINDING_API_KEY}
-      
-      # Embedding Configuration
-      - EMBEDDING_BINDING=${EMBEDDING_BINDING:-openai}
-      - EMBEDDING_MODEL=${EMBEDDING_MODEL:-text-embedding-3-large}
-      - EMBEDDING_DIM=${EMBEDDING_DIM:-3072}
-      - EMBEDDING_BINDING_API_KEY=${EMBEDDING_BINDING_API_KEY}
-      
-      # Optional: OpenAI API key
-      - OPENAI_API_KEY=${OPENAI_API_KEY}
-      - OPENAI_BASE_URL=${OPENAI_BASE_URL}
-      
-      # LightRAG Configuration
-      - ENABLE_LIGHTRAG=${ENABLE_LIGHTRAG:-true}
-      
-      # Logging
-      - LOG_LEVEL=${LOG_LEVEL:-INFO}
-      - VERBOSE=${VERBOSE:-false}
-      - LOG_DIR=/app/logs
-      
+
       # Redis Configuration (for message queue)
       - REDIS_HOST=redis
       - REDIS_PORT=6379
       - REDIS_DB=${REDIS_DB:-0}
       - REDIS_PASSWORD=${REDIS_PASSWORD:-}
-      
+
       # Queue Configuration
       - MAX_CONCURRENT_FILES=${MAX_CONCURRENT_FILES:-1}
-    
+
+      # Rewrite `localhost` in client-supplied webhook_url to
+      # `host.docker.internal` so callbacks reach services on the host.
+      - DOCKER_NETWORKING=${DOCKER_NETWORKING:-true}
+
     volumes:
       # Persist output and storage
       - ./output:/app/output
@@ -167,7 +133,7 @@ services:
       - ./logs:/app/logs
       
       # Optional: Mount models cache to avoid re-downloading
-      - rag_models_cache:/root/.cache
+      - rag_models_cache:/home/appuser/.cache
       
     networks:
       - rag-network
