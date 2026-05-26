@@ -79,3 +79,5 @@ memory-bank/
 .claude/
 .cursor/
 CLAUDE.md
+
+*.md
