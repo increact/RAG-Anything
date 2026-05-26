@@ -42,38 +42,39 @@ def save_result(
         content_list: Structured content blocks returned by the parser.
         metadata:     Processing metadata (parser, tables, formulas, images…).
     """
-    try:
-        Path(output_dir).mkdir(parents=True, exist_ok=True)
+    # Raises on disk failure so the caller knows not to send a "completed"
+    # webhook for a result that does not exist. Previously this swallowed the
+    # error and silently returned None, causing the client to receive 404 from
+    # GET /api/v1/result/{doc_id} after a "completed" notification.
+    Path(output_dir).mkdir(parents=True, exist_ok=True)
 
-        # Count content types if not already computed
-        if not any(k in metadata for k in ("tables", "formulas", "images")):
-            for item in content_list:
-                if isinstance(item, dict):
-                    t = item.get("type", "")
-                    if t == "table":
-                        metadata["tables"] = metadata.get("tables", 0) + 1
-                    elif t == "equation":
-                        metadata["formulas"] = metadata.get("formulas", 0) + 1
-                    elif t == "image":
-                        metadata["images"] = metadata.get("images", 0) + 1
+    # Count content types if not already computed
+    if not any(k in metadata for k in ("tables", "formulas", "images")):
+        for item in content_list:
+            if isinstance(item, dict):
+                t = item.get("type", "")
+                if t == "table":
+                    metadata["tables"] = metadata.get("tables", 0) + 1
+                elif t == "equation":
+                    metadata["formulas"] = metadata.get("formulas", 0) + 1
+                elif t == "image":
+                    metadata["images"] = metadata.get("images", 0) + 1
 
-        record = {
-            "doc_id": doc_id,
-            "document_id": document_id,
-            "project_id": project_id,
-            "processed_at": datetime.now(timezone.utc).isoformat(),
-            "metadata": metadata,
-            "markdown": markdown,
-            "content_list": content_list,
-        }
+    record = {
+        "doc_id": doc_id,
+        "document_id": document_id,
+        "project_id": project_id,
+        "processed_at": datetime.now(timezone.utc).isoformat(),
+        "metadata": metadata,
+        "markdown": markdown,
+        "content_list": content_list,
+    }
 
-        path = _result_path(output_dir, doc_id)
-        with open(path, "w", encoding="utf-8") as f:
-            json.dump(record, f, ensure_ascii=False)
+    path = _result_path(output_dir, doc_id)
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(record, f, ensure_ascii=False)
 
-        logger.info(f"Result saved: {path} (markdown={len(markdown)} chars, blocks={len(content_list)})")
-    except Exception as e:
-        logger.error(f"Failed to save result for doc_id={doc_id}: {e}")
+    logger.info(f"Result saved: {path} (markdown={len(markdown)} chars, blocks={len(content_list)})")
 
 
 def load_result(output_dir: str, doc_id: str) -> Optional[Dict[str, Any]]:

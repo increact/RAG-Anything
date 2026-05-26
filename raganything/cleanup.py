@@ -98,8 +98,18 @@ def cleanup_output_directory(output_dir: str, ttl_days: int) -> CleanupStats:
     cutoff = datetime.now(timezone.utc) - timedelta(days=ttl_days)
     cutoff_ts = cutoff.timestamp()
 
+    # Result files are the API's source of truth for `GET /api/v1/result/{doc_id}`
+    # and are typically expected to live longer than parser scratch files. A
+    # separate, longer TTL avoids the race where the webhook fires "completed"
+    # just before cleanup deletes the result the client is about to fetch.
+    result_ttl_days = int(os.environ.get("RESULT_TTL_DAYS", str(max(ttl_days, 30))))
+    result_cutoff_ts = (
+        datetime.now(timezone.utc) - timedelta(days=result_ttl_days)
+    ).timestamp()
+
     logger.info(
-        f"Running output cleanup: dir={output_dir}, ttl={ttl_days}d, "
+        f"Running output cleanup: dir={output_dir}, ttl={ttl_days}d "
+        f"(result_ttl={result_ttl_days}d), "
         f"cutoff={cutoff.strftime('%Y-%m-%d %H:%M UTC')}"
     )
 
@@ -108,7 +118,13 @@ def cleanup_output_directory(output_dir: str, ttl_days: int) -> CleanupStats:
             if entry.is_file():
                 mtime = entry.stat().st_mtime
                 size = entry.stat().st_size
-                if mtime < cutoff_ts:
+                # Apply the longer result TTL to *_result.json files.
+                effective_cutoff = (
+                    result_cutoff_ts
+                    if entry.name.endswith("_result.json")
+                    else cutoff_ts
+                )
+                if mtime < effective_cutoff:
                     entry.unlink()
                     stats.deleted_files += 1
                     stats.freed_bytes += size

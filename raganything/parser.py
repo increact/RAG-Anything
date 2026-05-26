@@ -963,11 +963,18 @@ class MineruParser(Parser):
                 f"Processing in chunks of {pages_per_chunk} pages."
             )
             all_content: List[Dict[str, Any]] = []
+            # Track failed chunks so a partially-parsed PDF is reported instead
+            # of silently returned as success. A document with missing pages
+            # produces an incomplete RAG knowledge base with no way to detect
+            # the gap from downstream code.
+            failed_chunks: List[tuple] = []
+            total_chunks = 0
 
             for chunk_start in range(0, total_pages, pages_per_chunk):
                 chunk_end = min(chunk_start + pages_per_chunk - 1, total_pages - 1)
                 chunk_output_dir = base_output_dir / f"_chunk_{chunk_start}_{chunk_end}"
                 chunk_output_dir.mkdir(parents=True, exist_ok=True)
+                total_chunks += 1
 
                 self.logger.info(
                     f"[MinerU] Processing pages {chunk_start}-{chunk_end} "
@@ -997,19 +1004,42 @@ class MineruParser(Parser):
                         self.logger.warning(
                             f"[MinerU] Chunk pages {chunk_start}-{chunk_end} produced no output"
                         )
+                        failed_chunks.append((chunk_start, chunk_end, "no output"))
                 except MineruExecutionError as e:
                     self.logger.error(
                         f"[MinerU] Chunk pages {chunk_start}-{chunk_end} failed: {e}. "
                         f"Skipping this chunk."
                     )
+                    failed_chunks.append((chunk_start, chunk_end, str(e)))
                 finally:
                     # Clean up chunk output and release memory between chunks
                     shutil.rmtree(chunk_output_dir, ignore_errors=True)
                     self._release_memory()
 
+            if failed_chunks:
+                # Loud warning so partial failures show up in monitoring. If
+                # the strict env var is set, fail the whole parse instead of
+                # returning incomplete content.
+                self.logger.warning(
+                    "[MinerU] %d/%d chunk(s) failed for %s. Failed ranges: %s",
+                    len(failed_chunks), total_chunks, pdf_path,
+                    [(s, e) for s, e, _ in failed_chunks],
+                )
+                strict = __import__("os").environ.get(
+                    "MINERU_STRICT_CHUNK_FAILURE", "false"
+                ).lower() in ("true", "1", "yes")
+                if strict:
+                    raise MineruExecutionError(
+                        1,
+                        f"{len(failed_chunks)}/{total_chunks} chunks failed; "
+                        f"refusing to return partial content (set "
+                        f"MINERU_STRICT_CHUNK_FAILURE=false to allow).",
+                    )
+
             self.logger.info(
                 f"[MinerU] Chunked processing complete: {len(all_content)} total blocks "
-                f"from {total_pages} pages"
+                f"from {total_pages} pages "
+                f"({total_chunks - len(failed_chunks)}/{total_chunks} chunks OK)"
             )
             return all_content
 
@@ -1637,9 +1667,26 @@ class DoclingParser(Parser):
                 )
         return content_list
 
+    @staticmethod
+    def _docling_page_idx(block: Dict[str, Any]) -> int:
+        """Extract the real page number from a Docling block's provenance.
+
+        Docling stores 1-indexed `page_no` in `prov`; the rest of the pipeline
+        expects 0-indexed `page_idx`. We fall back to 0 when the field is
+        missing so downstream context extraction has a safe default rather than
+        the previous fabricated `cnt // 10` value.
+        """
+        prov = block.get("prov") or []
+        if prov and isinstance(prov[0], dict):
+            page_no = prov[0].get("page_no")
+            if isinstance(page_no, int):
+                return max(0, page_no - 1)
+        return 0
+
     def read_from_block(
         self, block, type: str, output_dir: Path, cnt: int, num: str
     ) -> Dict[str, Any]:
+        page_idx = self._docling_page_idx(block)
         if type == "texts":
             if block["label"] == "formula":
                 return {
@@ -1647,13 +1694,13 @@ class DoclingParser(Parser):
                     "img_path": "",
                     "text": block["orig"],
                     "text_format": "unknown",
-                    "page_idx": cnt // 10,
+                    "page_idx": page_idx,
                 }
             else:
                 return {
                     "type": "text",
                     "text": block["orig"],
-                    "page_idx": cnt // 10,
+                    "page_idx": page_idx,
                 }
         elif type == "pictures":
             try:
@@ -1670,14 +1717,14 @@ class DoclingParser(Parser):
                     "img_path": str(image_path.resolve()),  # Convert to absolute path
                     "image_caption": block.get("caption", ""),
                     "image_footnote": block.get("footnote", ""),
-                    "page_idx": cnt // 10,
+                    "page_idx": page_idx,
                 }
             except Exception as e:
                 self.logger.warning(f"Failed to process image {num}: {e}")
                 return {
                     "type": "text",
                     "text": f"[Image processing failed: {block.get('caption', '')}]",
-                    "page_idx": cnt // 10,
+                    "page_idx": page_idx,
                 }
         else:
             try:
@@ -1687,14 +1734,14 @@ class DoclingParser(Parser):
                     "table_caption": block.get("caption", ""),
                     "table_footnote": block.get("footnote", ""),
                     "table_body": block.get("data", []),
-                    "page_idx": cnt // 10,
+                    "page_idx": page_idx,
                 }
             except Exception as e:
                 self.logger.warning(f"Failed to process table {num}: {e}")
                 return {
                     "type": "text",
                     "text": f"[Table processing failed: {block.get('caption', '')}]",
-                    "page_idx": cnt // 10,
+                    "page_idx": page_idx,
                 }
 
     def parse_office_doc(

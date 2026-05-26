@@ -4,6 +4,7 @@ Utility functions for RAGAnything
 Contains helper functions for content separation, text insertion, and other utilities
 """
 
+import os
 import base64
 from typing import Dict, List, Any, Tuple
 from pathlib import Path
@@ -66,7 +67,16 @@ def encode_image_to_base64(image_path: str) -> str:
     Returns:
         str: Base64 encoded string, empty string if encoding fails
     """
+    # Bound by MAX_IMAGE_SIZE_MB so a single oversized image cannot OOM the worker.
+    max_mb = int(os.environ.get("MAX_IMAGE_SIZE_MB", "50"))
     try:
+        size = os.path.getsize(image_path)
+        if size > max_mb * 1024 * 1024:
+            logger.warning(
+                "Skipping image base64 encode: %s exceeds %d MB limit (%d bytes)",
+                image_path, max_mb, size,
+            )
+            return ""
         with open(image_path, "rb") as image_file:
             encoded_string = base64.b64encode(image_file.read()).decode("utf-8")
         return encoded_string
@@ -201,7 +211,9 @@ async def insert_text_content_with_multimodal_content(
     """
     logger.info("Starting text content insertion into LightRAG...")
 
-    # Use LightRAG's insert method with all parameters
+    # Use LightRAG's insert method with all parameters. If ainsert raises, log
+    # ERROR and re-raise: silently swallowing here lets the caller believe the
+    # document was indexed when nothing was actually written.
     try:
         await lightrag.ainsert(
             input=input,
@@ -212,11 +224,17 @@ async def insert_text_content_with_multimodal_content(
             ids=ids,
             scheme_name=scheme_name,
         )
-    except Exception as e:
-        logger.info(f"Error: {e}")
-        logger.info(
-            "If the error is caused by the ainsert function not having a multimodal content parameter, please update the raganything branch of lightrag"
+    except TypeError as e:
+        logger.error(
+            "lightrag.ainsert rejected the multimodal_content kwarg — your "
+            "lightrag version is incompatible. Please use the raganything "
+            "branch of lightrag. Original error: %s",
+            e,
         )
+        raise
+    except Exception as e:
+        logger.error("Failed to insert text content into LightRAG: %s", e)
+        raise
 
     logger.info("Text content insertion complete")
 

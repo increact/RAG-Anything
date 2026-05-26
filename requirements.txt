@@ -1,15 +1,22 @@
-huggingface_hub
-# LightRAG packages
+# Production deployments should NOT rely on this file directly: it has only
+# upper-bound guards, not exact pins. Generate a lockfile with
+# `pip-compile requirements.txt -o requirements.lock` (or `uv pip compile`)
+# and install from the lockfile in the Dockerfile to get reproducible builds.
+
+huggingface_hub<1.0
+# LightRAG packages — pin a major when stable; the raganything branch
+# requires lightrag-hku with the `multimodal_content` kwarg on ainsert.
 lightrag-hku
-# MinerU 2.0 packages (replaces magic-pdf)
-mineru[core]
+# MinerU 2.0 packages (replaces magic-pdf). Cap below 3.0 — major-version
+# changes in MinerU have repeatedly altered memory behaviour and CLI flags.
+mineru[core]<3.0
 # Progress bars for batch processing
 tqdm
 # HTTP client for webhook callbacks
-httpx>=0.24.0
+httpx>=0.24.0,<1.0
 # Message queue for document processing
-redis>=5.0.0
-rq>=1.15.0
+redis>=5.0.0,<6.0
+rq>=1.15.0,<3.0
 # Note: Optional dependencies are now defined in setup.py extras_require:
 # - [image]: Pillow>=10.0.0 (for BMP, TIFF, GIF, WebP format conversion)
 # - [text]: reportlab>=4.0.0 (for TXT, MD to PDF conversion)

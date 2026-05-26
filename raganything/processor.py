@@ -283,6 +283,7 @@ class ProcessorMixin:
         output_dir: str = None,
         parse_method: str = None,
         display_stats: bool = None,
+        parser: str = None,
         **kwargs,
     ) -> tuple[List[Dict[str, Any]], str]:
         """
@@ -293,6 +294,9 @@ class ProcessorMixin:
             output_dir: Output directory (defaults to config.parser_output_dir)
             parse_method: Parse method (defaults to config.parse_method)
             display_stats: Whether to display content statistics (defaults to config.display_content_stats)
+            parser: Parser to use for this call ("mineru"/"docling"); overrides config.parser
+                without mutating shared state — necessary because callers may invoke
+                parse_document concurrently with different parsers.
             **kwargs: Additional parameters for parser (e.g., lang, device, start_page, end_page, formula, table, backend, source)
 
         Returns:
@@ -305,6 +309,7 @@ class ProcessorMixin:
             parse_method = self.config.parse_method
         if display_stats is None:
             display_stats = self.config.display_content_stats
+        effective_parser = parser if parser is not None else self.config.parser
 
         self.logger.info(f"Starting document parsing: {file_path}")
 
@@ -332,13 +337,21 @@ class ProcessorMixin:
         ext = file_path.suffix.lower()
 
         try:
-            doc_parser = (
-                DoclingParser() if self.config.parser == "docling" else MineruParser()
-            )
+            # Reuse a single parser instance per type. The previous code
+            # constructed a fresh parser on every call, which sidestepped the
+            # `_parser_installation_checked` cache held on self.doc_parser.
+            if not hasattr(self, "_parser_cache"):
+                self._parser_cache = {}
+            doc_parser = self._parser_cache.get(effective_parser)
+            if doc_parser is None:
+                doc_parser = (
+                    DoclingParser() if effective_parser == "docling" else MineruParser()
+                )
+                self._parser_cache[effective_parser] = doc_parser
 
             # Log parser and method information
             self.logger.info(
-                f"Using {self.config.parser} parser with method: {parse_method}"
+                f"Using {effective_parser} parser with method: {parse_method}"
             )
 
             if ext in [".pdf"]:
@@ -372,7 +385,7 @@ class ProcessorMixin:
                 else:
                     # Fallback to MinerU for image parsing if current parser doesn't support it
                     self.logger.warning(
-                        f"{self.config.parser} parser doesn't support image parsing, falling back to MinerU"
+                        f"{effective_parser} parser doesn't support image parsing, falling back to MinerU"
                     )
                     content_list = MineruParser().parse_image(
                         image_path=file_path, output_dir=output_dir, **kwargs
@@ -415,7 +428,7 @@ class ProcessorMixin:
             raise
         except Exception as e:
             self.logger.error(
-                f"Error during parsing with {self.config.parser} parser: {str(e)}"
+                f"Error during parsing with {effective_parser} parser: {str(e)}"
             )
             raise e
 
@@ -696,9 +709,11 @@ class ProcessorMixin:
             await self.lightrag._insert_done()
 
         self.logger.info("Individual multimodal content processing complete")
-
-        # Mark multimodal content as processed
-        await self._mark_multimodal_processing_complete(doc_id)
+        # Note: _mark_multimodal_processing_complete is intentionally NOT called
+        # here — the caller (the fallback branch in _process_multimodal_content)
+        # marks completion after we return. Marking here as well would
+        # double-mark and, worse, would falsely mark the doc complete if this
+        # method itself raised partway through.
 
     async def _process_multimodal_content_batch_type_aware(
         self, multimodal_items: List[Dict[str, Any]], file_path: str, doc_id: str
@@ -1559,11 +1574,11 @@ class ProcessorMixin:
         doc_pre_id = f"doc-pre-{file_name}"
         pipeline_status = None
         pipeline_status_lock = None
+        # Per-call parser; do NOT mutate self.config.parser (shared mutable state
+        # across concurrent jobs).
+        effective_parser = parser if parser is not None else self.config.parser
 
-        if parser:
-            self.config.parser = parser
-
-        current_doc_status = await self.lightrag.doc_status.get_by_id(doc_pre_id)
+        current_doc_status = await self.lightrag.doc_status.get_by_id(doc_pre_id) or {}
 
         try:
             # Ensure LightRAG is initialized
@@ -1640,9 +1655,14 @@ class ProcessorMixin:
             content_based_doc_id = ""
 
             try:
-                # Step 1: Parse document
+                # Step 1: Parse document — thread parser through so we don't mutate config.
                 content_list, content_based_doc_id = await self.parse_document(
-                    file_path, output_dir, parse_method, display_stats, **kwargs
+                    file_path,
+                    output_dir,
+                    parse_method,
+                    display_stats,
+                    parser=effective_parser,
+                    **kwargs,
                 )
             except MineruExecutionError as e:
                 error_message = e.error_msg
@@ -1743,15 +1763,19 @@ class ProcessorMixin:
             return False
 
         finally:
-            async with pipeline_status_lock:
-                pipeline_status.update({"scan_disabled": False})
-                pipeline_status["latest_message"] = (
-                    f"RAGAnything processing completed for {file_name}"
-                )
-                pipeline_status["history_messages"].append(
-                    f"RAGAnything processing completed for {file_name}"
-                )
-                pipeline_status["history_messages"].append("Now is allowed to scan")
+            # Guard: when init fails before pipeline_status is fetched both vars
+            # are None and `async with None` would raise AttributeError, masking
+            # the real error.
+            if pipeline_status_lock is not None and pipeline_status is not None:
+                async with pipeline_status_lock:
+                    pipeline_status.update({"scan_disabled": False})
+                    pipeline_status["latest_message"] = (
+                        f"RAGAnything processing completed for {file_name}"
+                    )
+                    pipeline_status["history_messages"].append(
+                        f"RAGAnything processing completed for {file_name}"
+                    )
+                    pipeline_status["history_messages"].append("Now is allowed to scan")
 
     async def insert_content_list(
         self,

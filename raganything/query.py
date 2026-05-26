@@ -7,7 +7,7 @@ Contains all query-related methods for both text and multimodal queries
 import json
 import hashlib
 import re
-from typing import Dict, List, Any
+from typing import Dict, List, Any, Optional
 from pathlib import Path
 from lightrag import QueryParam
 from lightrag.utils import always_get_an_event_loop
@@ -327,22 +327,19 @@ class QueryMixin:
 
         self.logger.info(f"Executing VLM enhanced query: {query[:100]}...")
 
-        # Clear previous image cache
-        if hasattr(self, "_current_images_base64"):
-            delattr(self, "_current_images_base64")
-
         # 1. Get original retrieval prompt (without generating final answer)
         query_param = QueryParam(mode=mode, only_need_prompt=True, **kwargs)
         raw_prompt = await self.lightrag.aquery(query, param=query_param)
 
         self.logger.debug("Retrieved raw prompt from LightRAG")
 
-        # 2. Extract and process image paths
-        enhanced_prompt, images_found = await self._process_image_paths_for_vlm(
+        # 2. Extract and process image paths — images returned explicitly so
+        # concurrent VLM queries don't share state via self.
+        enhanced_prompt, images_base64 = await self._process_image_paths_for_vlm(
             raw_prompt
         )
 
-        if not images_found:
+        if not images_base64:
             self.logger.info("No valid images found, falling back to normal query")
             # Fallback to normal query
             query_param = QueryParam(mode=mode, **kwargs)
@@ -350,11 +347,11 @@ class QueryMixin:
                 query, param=query_param, system_prompt=system_prompt
             )
 
-        self.logger.info(f"Processed {images_found} images for VLM")
+        self.logger.info(f"Processed {len(images_base64)} images for VLM")
 
         # 3. Build VLM message format
         messages = self._build_vlm_messages_with_images(
-            enhanced_prompt, query, system_prompt
+            enhanced_prompt, query, system_prompt, images_base64
         )
 
         # 4. Call VLM for question answering
@@ -530,7 +527,7 @@ class QueryMixin:
 
         return description
 
-    async def _process_image_paths_for_vlm(self, prompt: str) -> tuple[str, int]:
+    async def _process_image_paths_for_vlm(self, prompt: str) -> tuple[str, list]:
         """
         Process image paths in prompt, keeping original paths and adding VLM markers
 
@@ -541,10 +538,9 @@ class QueryMixin:
             tuple: (processed prompt, image count)
         """
         enhanced_prompt = prompt
-        images_processed = 0
-
-        # Initialize image cache
-        self._current_images_base64 = []
+        # Local-only state: previously stored on self, which interleaved
+        # images between concurrent queries on the same instance.
+        images_base64: list = []
 
         # Enhanced regex pattern for matching image paths
         # Matches only the path ending with image file extensions
@@ -557,8 +553,6 @@ class QueryMixin:
         self.logger.info(f"Found {len(matches)} image path matches in prompt")
 
         def replace_image_path(match):
-            nonlocal images_processed
-
             image_path = match.group(1).strip()
             self.logger.debug(f"Processing image path: '{image_path}'")
 
@@ -568,32 +562,22 @@ class QueryMixin:
                 return match.group(0)  # Keep original
 
             # Use utility function to validate image file
-            self.logger.debug(f"Calling validate_image_file for: {image_path}")
             is_valid = validate_image_file(image_path)
-            self.logger.debug(f"Validation result for {image_path}: {is_valid}")
-
             if not is_valid:
                 self.logger.warning(f"Image validation failed for: {image_path}")
                 return match.group(0)  # Keep original if validation fails
 
             try:
-                # Encode image to base64 using utility function
-                self.logger.debug(f"Attempting to encode image: {image_path}")
                 image_base64 = encode_image_to_base64(image_path)
                 if image_base64:
-                    images_processed += 1
-                    # Save base64 to instance variable for later use
-                    self._current_images_base64.append(image_base64)
-
+                    images_base64.append(image_base64)
                     # Keep original path info and add VLM marker
-                    result = f"Image Path: {image_path}\n[VLM_IMAGE_{images_processed}]"
-                    self.logger.debug(
-                        f"Successfully processed image {images_processed}: {image_path}"
+                    return (
+                        f"Image Path: {image_path}\n"
+                        f"[VLM_IMAGE_{len(images_base64)}]"
                     )
-                    return result
-                else:
-                    self.logger.error(f"Failed to encode image: {image_path}")
-                    return match.group(0)  # Keep original if encoding failed
+                self.logger.error(f"Failed to encode image: {image_path}")
+                return match.group(0)
 
             except Exception as e:
                 self.logger.error(f"Failed to process image {image_path}: {e}")
@@ -604,10 +588,14 @@ class QueryMixin:
             image_path_pattern, replace_image_path, enhanced_prompt
         )
 
-        return enhanced_prompt, images_processed
+        return enhanced_prompt, images_base64
 
     def _build_vlm_messages_with_images(
-        self, enhanced_prompt: str, user_query: str, system_prompt: str
+        self,
+        enhanced_prompt: str,
+        user_query: str,
+        system_prompt: str,
+        images_base64: Optional[List[str]] = None,
     ) -> List[Dict]:
         """
         Build VLM message format, using markers to correspond images with text positions
@@ -615,11 +603,13 @@ class QueryMixin:
         Args:
             enhanced_prompt: Enhanced prompt with image markers
             user_query: User query
+            images_base64: Per-call image list (passed explicitly, not via self)
 
         Returns:
             List[Dict]: VLM message format
         """
-        images_base64 = getattr(self, "_current_images_base64", [])
+        if images_base64 is None:
+            images_base64 = []
 
         if not images_base64:
             # Pure text mode
@@ -701,9 +691,15 @@ class QueryMixin:
             str: VLM response result
         """
         try:
-            user_message = messages[1]
+            # Look up by role rather than positional index — the pure-text
+            # fallback path returns a single-element [user] list with no
+            # system entry, where messages[1] would IndexError.
+            user_message = next((m for m in messages if m.get("role") == "user"), None)
+            system_message = next((m for m in messages if m.get("role") == "system"), None)
+            if user_message is None:
+                raise ValueError("VLM messages list missing a user entry")
             content = user_message["content"]
-            system_prompt = messages[0]["content"]
+            system_prompt = system_message["content"] if system_message else None
 
             if isinstance(content, str):
                 # Pure text mode
