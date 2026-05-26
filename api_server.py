@@ -190,7 +190,7 @@ async def lifespan(app: FastAPI):
     logger.info(f"Processing semaphore initialized with max_concurrent={max_concurrent}")
     
     # Check if LightRAG is enabled
-    enable_lightrag = os.getenv("ENABLE_LIGHTRAG", "true").lower() in ("true", "1", "yes")
+    enable_lightrag = os.getenv("ENABLE_LIGHTRAG", "false").lower() in ("true", "1", "yes")
     
     # Startup: Initialize RAG instance
     if enable_lightrag:
@@ -670,7 +670,7 @@ async def health_check():
     - RAG instance initialization status
     - LightRAG enabled status
     """
-    enable_lightrag = os.getenv("ENABLE_LIGHTRAG", "true").lower() in ("true", "1", "yes")
+    enable_lightrag = os.getenv("ENABLE_LIGHTRAG", "false").lower() in ("true", "1", "yes")
     return HealthResponse(
         status="healthy",
         service="rag-anything-api",

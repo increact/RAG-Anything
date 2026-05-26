@@ -45,7 +45,7 @@ from raganything.document_worker import set_rag_instance
 logger.info("Initializing RAG instance for worker...")
 
 # Check if LightRAG is enabled
-enable_lightrag = os.getenv("ENABLE_LIGHTRAG", "true").lower() in ("true", "1", "yes")
+enable_lightrag = os.getenv("ENABLE_LIGHTRAG", "false").lower() in ("true", "1", "yes")
 
 try:
     # Create configuration
