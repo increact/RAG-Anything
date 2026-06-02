@@ -185,6 +185,11 @@ async def process_document_task_async(task_data: Dict[str, Any]) -> Dict[str, An
             vlm_description = await describe_image(temp_file, rag_instance.vision_model_func)
             if vlm_description:
                 markdown = f"{markdown}\n\n## Image Analysis (VLM)\n\n{vlm_description}"
+                # Also surface the description as a text block in content_list
+                # so downstream consumers using structured indexing (which
+                # ignores markdown when content_list is non-empty) still pick
+                # up the VLM analysis.
+                content_list.append({"type": "text", "text": vlm_description})
                 vlm_model = os.getenv("VISION_MODEL", "openai/gpt-4o-mini")
                 logger.info("Added VLM image description for %s", temp_file)
 
