@@ -10,7 +10,7 @@ WORKDIR /app
 # LibreOffice for Office document support
 # Additional tools for document processing
 # curl: used by the healthcheck (smaller and timeout-safe vs python requests)
-RUN apt-get update && apt-get install -y --no-install-recommends \
+RUN apt-get update && apt-get install -y \
     build-essential \
     libreoffice \
     libreoffice-writer \
