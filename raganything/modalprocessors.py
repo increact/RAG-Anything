@@ -9,6 +9,7 @@ Includes:
 - GenericModalProcessor: Processor for other modal content
 """
 
+import os
 import re
 import json
 import time
@@ -383,10 +384,14 @@ class BaseModalProcessor:
         self.relationships_vdb = lightrag.relationships_vdb
         self.knowledge_graph_inst = lightrag.chunk_entity_relation_graph
 
-        # Use LightRAG's configuration and functions
+        # Use LightRAG's configuration and functions.
+        # NOTE: shallow copy via __dict__ — asdict() recursively deep-copies the
+        # entire LightRAG (storages, locks, embedding fns), which is an OOM
+        # trigger on memory-constrained workers. ProcessorMixin uses the same
+        # shallow pattern.
         self.embedding_func = lightrag.embedding_func
         self.llm_model_func = lightrag.llm_model_func
-        self.global_config = asdict(lightrag)
+        self.global_config = dict(lightrag.__dict__)
         self.hashing_kv = lightrag.llm_response_cache
         self.tokenizer = lightrag.tokenizer
 
@@ -812,8 +817,21 @@ class ImageModalProcessor(BaseModalProcessor):
         super().__init__(lightrag, modal_caption_func, context_extractor)
 
     def _encode_image_to_base64(self, image_path: str) -> str:
-        """Encode image to base64"""
+        """Encode image to base64.
+
+        Enforces a size cap before reading the file into memory: encoding a
+        200 MB image into base64 produces a ~270 MB string and is a known OOM
+        trigger on memory-constrained workers.
+        """
+        max_mb = int(os.environ.get("MAX_IMAGE_SIZE_MB", "50"))
         try:
+            size = os.path.getsize(image_path)
+            if size > max_mb * 1024 * 1024:
+                logger.warning(
+                    "Skipping image base64 encode: %s exceeds %d MB limit (%d bytes)",
+                    image_path, max_mb, size,
+                )
+                return ""
             with open(image_path, "rb") as image_file:
                 encoded_string = base64.b64encode(image_file.read()).decode("utf-8")
             return encoded_string

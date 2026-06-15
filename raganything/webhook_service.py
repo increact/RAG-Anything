@@ -6,11 +6,23 @@ Full processing results are served via GET /api/v1/result/{doc_id}.
 """
 import asyncio
 import httpx
+import urllib.parse
 from datetime import datetime, timezone
 from typing import Optional
 import logging
 
 logger = logging.getLogger(__name__)
+
+
+def _redact(url: str) -> str:
+    """Strip query/fragment from a URL so secrets passed in query strings do not leak to logs."""
+    if not url:
+        return ""
+    try:
+        p = urllib.parse.urlparse(url)
+        return f"{p.scheme}://{p.netloc}{p.path}"
+    except Exception:
+        return "<unparseable url>"
 
 
 class WebhookService:
@@ -58,7 +70,7 @@ class WebhookService:
         for attempt in range(max_retries):
             try:
                 logger.info(
-                    f"Sending webhook to {webhook_url} for document {document_id} "
+                    f"Sending webhook to {_redact(webhook_url)} for document {document_id} "
                     f"(attempt {attempt + 1}/{max_retries}, status={status})"
                 )
 

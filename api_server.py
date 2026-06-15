@@ -8,6 +8,7 @@ Designed to be called from the client backend service.
 
 import os
 import sys
+import hmac
 import asyncio
 import tempfile
 import logging
@@ -23,8 +24,18 @@ from fastapi.security import APIKeyHeader
 from fastapi.responses import StreamingResponse, JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.openapi.utils import get_openapi
-from pydantic import BaseModel, Field
 from dotenv import load_dotenv
+
+from raganything.image_vlm import build_vision_model_func, is_image_file, describe_image
+
+from api_models import (
+    DocumentMetadata,
+    ProcessDocumentResponse,
+    ProcessContentListResponse,
+    HealthResponse,
+    ResultMetadata,
+    DocumentResultResponse,
+)
 
 # Add project root to path
 sys.path.insert(0, str(Path(__file__).parent))
@@ -65,6 +76,42 @@ API_KEY_NAME = "X-API-Key"
 api_key_header = APIKeyHeader(name=API_KEY_NAME, auto_error=False)
 
 
+# Input-validation helpers live in validation.py (standalone, unit-tested).
+# Imported under the historic underscore-prefixed names used at the call sites.
+from validation import (  # noqa: E402
+    validate_external_url as _validate_external_url,
+    validate_doc_id as _validate_doc_id,
+    redact_url as _redact_url,
+    safe_tempfile_suffix as _safe_tempfile_suffix,
+)
+
+
+async def _read_upload_bounded(file: UploadFile, max_mb: Optional[int] = None) -> bytes:
+    """Read an UploadFile into memory with an enforced size cap.
+
+    Streams the body in 1 MB chunks and aborts as soon as the running total
+    exceeds the limit, so a malicious 10 GB upload does not buffer fully
+    before being rejected.
+    """
+    if max_mb is None:
+        max_mb = int(os.getenv("MAX_FILE_SIZE_MB", "500"))
+    max_bytes = max_mb * 1024 * 1024
+    chunks: List[bytes] = []
+    total = 0
+    while True:
+        chunk = await file.read(1024 * 1024)
+        if not chunk:
+            break
+        total += len(chunk)
+        if total > max_bytes:
+            raise HTTPException(
+                status_code=413,
+                detail=f"File too large. Maximum allowed size is {max_mb} MB.",
+            )
+        chunks.append(chunk)
+    return b"".join(chunks)
+
+
 async def verify_api_key(api_key: Optional[str] = Security(api_key_header)):
     """
     Verify API key from request header
@@ -95,14 +142,15 @@ async def verify_api_key(api_key: Optional[str] = Security(api_key_header)):
             headers={"WWW-Authenticate": "ApiKey"},
         )
     
-    # Verify API key
-    if api_key != configured_api_key:
+    # Verify API key using a constant-time comparison so an on-host attacker
+    # cannot recover the key character-by-character via timing side channels.
+    if not hmac.compare_digest(api_key, configured_api_key):
         logger.warning(f"Invalid API key attempt: {api_key[:8]}...")
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
             detail="Invalid API key",
         )
-    
+
     return api_key
 
 
@@ -129,51 +177,19 @@ async def _send_webhook(
     )
 
 
-class ProcessDocumentRequest(BaseModel):
-    """Request model for document processing"""
-    parser: Optional[str] = Field(default="auto", description="Parser: auto, mineru, or docling")
-    parse_method: Optional[str] = Field(default="auto", description="Parse method: auto, ocr, or txt")
-    language: Optional[str] = Field(default="zh", description="Document language for OCR")
-    device: Optional[str] = Field(default="cpu", description="Device: cpu, cuda:0, mps")
-    formula: Optional[bool] = Field(default=True, description="Enable formula extraction")
-    table: Optional[bool] = Field(default=True, description="Enable table extraction")
-    backend: Optional[str] = Field(default="pipeline", description="Backend: pipeline, vlm-transformers")
+# asyncio.create_task() returns a task whose only strong reference is the
+# caller's local variable; once that goes out of scope (which happens
+# immediately for fire-and-forget patterns) the GC can collect and cancel the
+# task mid-flight. Stash references in this set and drop them only when the
+# task finishes.
+_BACKGROUND_TASKS: set = set()
 
 
-class DocumentMetadata(BaseModel):
-    """Metadata about the processed document"""
-    parser: str = Field(..., description="Parser used (mineru or docling)")
-    parse_method: str = Field(..., description="Parse method used (auto, ocr, txt)")
-    doc_id: str = Field(..., description="Document ID")
-    tables: int = Field(0, description="Number of tables extracted")
-    formulas: int = Field(0, description="Number of formulas extracted")
-    images: int = Field(0, description="Number of images extracted")
-
-
-class ProcessDocumentResponse(BaseModel):
-    """Response model for document processing"""
-    success: bool = Field(..., description="Whether processing was successful")
-    markdown: str = Field(..., description="Converted Markdown content")
-    metadata: Optional[DocumentMetadata] = Field(None, description="Document metadata")
-    error: Optional[str] = Field(None, description="Error message (if processing failed)")
-    debug_info: Optional[Dict[str, Any]] = Field(None, description="Debug information (development mode)")
-
-
-class ProcessContentListResponse(BaseModel):
-    """Response model for content_list-only processing"""
-    success: bool = Field(..., description="Whether processing was successful")
-    content_list: Optional[List[Dict[str, Any]]] = Field(None, description="Parsed content list")
-    metadata: Optional[DocumentMetadata] = Field(None, description="Document metadata")
-    error: Optional[str] = Field(None, description="Error message (if processing failed)")
-
-
-class HealthResponse(BaseModel):
-    """Health check response"""
-    status: str = Field(..., description="Service status", example="healthy")
-    service: str = Field(..., description="Service name", example="rag-anything-api")
-    rag_initialized: bool = Field(..., description="Whether RAG instance is initialized")
-    lightrag_enabled: bool = Field(..., description="Whether LightRAG is enabled")
-    queue_available: bool = Field(False, description="Whether the document queue (Redis) is available")
+def _fire_and_forget_webhook(**kwargs) -> None:
+    """Schedule a webhook send without losing the task to GC."""
+    task = asyncio.create_task(_send_webhook(**kwargs))
+    _BACKGROUND_TASKS.add(task)
+    task.add_done_callback(_BACKGROUND_TASKS.discard)
 
 
 @asynccontextmanager
@@ -190,7 +206,7 @@ async def lifespan(app: FastAPI):
     logger.info(f"Processing semaphore initialized with max_concurrent={max_concurrent}")
     
     # Check if LightRAG is enabled
-    enable_lightrag = os.getenv("ENABLE_LIGHTRAG", "true").lower() in ("true", "1", "yes")
+    enable_lightrag = os.getenv("ENABLE_LIGHTRAG", "false").lower() in ("true", "1", "yes")
     
     # Startup: Initialize RAG instance
     if enable_lightrag:
@@ -209,6 +225,9 @@ async def lifespan(app: FastAPI):
             enable_equation_processing=True,
         )
         
+        # Vision model for image description (independent provider, see image_vlm).
+        vision_model_func = build_vision_model_func()
+
         if enable_lightrag:
             if not LIGHTRAG_AVAILABLE:
                 logger.error("LightRAG is enabled but imports are not available. Please install lightrag package.")
@@ -254,6 +273,7 @@ async def lifespan(app: FastAPI):
                 config=config,
                 llm_model_func=llm_model_func,
                 embedding_func=embedding_func,
+                vision_model_func=vision_model_func,
             )
             
             logger.info("✅ RAG-Anything service initialized successfully with LightRAG")
@@ -265,6 +285,7 @@ async def lifespan(app: FastAPI):
                 config=config,
                 llm_model_func=None,
                 embedding_func=None,
+                vision_model_func=vision_model_func,
             )
             # Set lightrag to None explicitly to disable RAG features
             rag_instance.lightrag = None
@@ -376,11 +397,17 @@ app = FastAPI(
     ],
 )
 
-# Configure CORS
+# Configure CORS.
+# When CORS_ALLOW_ORIGINS is unset we fall back to "*" + allow_credentials=False
+# (the only spec-legal combination) so the API key auth path keeps working from
+# arbitrary non-browser clients without silently breaking browser preflights.
+_cors_origins_env = os.getenv("CORS_ALLOW_ORIGINS", "*").strip()
+_cors_origins = [o.strip() for o in _cors_origins_env.split(",") if o.strip()]
+_cors_allow_credentials = "*" not in _cors_origins
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # Configure appropriately for production
-    allow_credentials=True,
+    allow_origins=_cors_origins,
+    allow_credentials=_cors_allow_credentials,
     allow_methods=["*"],
     allow_headers=["*"],
 )
@@ -409,51 +436,21 @@ async def get_document_by_id(doc_id: str):
     """
     Get document information by doc_id
     """
-    try:
-        output_dir = os.getenv("OUTPUT_DIR", "./output")
-        output_path = Path(output_dir)
-        
-        # Search for files containing this doc_id
-        found_files = []
-        
-        # Search all .md and .json files
-        for md_file in output_path.rglob("*.md"):
-            try:
-                with open(md_file, "r", encoding="utf-8") as f:
-                    content = f.read()
-                    if content:
-                        found_files.append({
-                            "type": "markdown",
-                            "path": str(md_file.relative_to(output_path)),
-                            "full_path": str(md_file),
-                            "size": len(content),
-                        })
-            except Exception:
-                pass
-        
-        for json_file in output_path.rglob("*_content_list.json"):
-            try:
-                with open(json_file, "r", encoding="utf-8") as f:
-                    content_list = json.load(f)
-                    found_files.append({
-                        "type": "content_list",
-                        "path": str(json_file.relative_to(output_path)),
-                        "full_path": str(json_file),
-                        "items": len(content_list),
-                    })
-            except Exception:
-                pass
-        
-        return {
-            "doc_id": doc_id,
-            "found_files": found_files,
-            "output_dir": output_dir,
-            "note": "Use /api/v1/doc-content/{doc_id} to get actual content, or directly access files in the output directory",
-        }
-        
-    except Exception as e:
-        logger.error(f"Error retrieving document {doc_id}: {str(e)}")
-        raise HTTPException(status_code=500, detail=str(e))
+    _validate_doc_id(doc_id)
+    from raganything.result_store import load_result
+    output_dir = os.getenv("OUTPUT_DIR", "./output")
+    record = load_result(output_dir, doc_id)
+    if record is None:
+        raise HTTPException(status_code=404, detail=f"Document not found: {doc_id}")
+    return {
+        "doc_id": record["doc_id"],
+        "document_id": record.get("document_id", ""),
+        "project_id": record.get("project_id", ""),
+        "processed_at": record.get("processed_at", ""),
+        "metadata": record.get("metadata", {}),
+        "markdown_size": len(record.get("markdown", "")),
+        "content_blocks": len(record.get("content_list", [])),
+    }
 
 
 @app.get(
@@ -472,47 +469,21 @@ async def get_document_content(doc_id: str):
     """
     Get document Markdown content
     """
-    try:
-        output_dir = os.getenv("OUTPUT_DIR", "./output")
-        output_path = Path(output_dir)
-        
-        # Search all possible markdown files
-        markdown_files = list(output_path.rglob("*.md"))
-        
-        # Try to find the most relevant file
-        markdown_content = None
-        found_file = None
-        
-        # Sort by modification time, get the latest
-        if markdown_files:
-            markdown_files.sort(key=lambda p: p.stat().st_mtime, reverse=True)
-            latest_file = markdown_files[0]
-            try:
-                with open(latest_file, "r", encoding="utf-8") as f:
-                    markdown_content = f.read()
-                    found_file = str(latest_file.relative_to(output_path))
-            except Exception as e:
-                logger.warning(f"Failed to read {latest_file}: {e}")
-        
-        if markdown_content:
-            return {
-                "doc_id": doc_id,
-                "markdown": markdown_content,
-                "source_file": found_file,
-                "length": len(markdown_content),
-                "note": "Returns the most recently processed document content. If this is not what you want, please directly access files in the output directory.",
-            }
-        else:
-            raise HTTPException(
-                status_code=404,
-                detail=f"Document content not found for doc_id: {doc_id}. Please check output directory: {output_dir}",
-            )
-            
-    except HTTPException:
-        raise
-    except Exception as e:
-        logger.error(f"Error retrieving document content {doc_id}: {str(e)}")
-        raise HTTPException(status_code=500, detail=str(e))
+    _validate_doc_id(doc_id)
+    from raganything.result_store import load_result
+    output_dir = os.getenv("OUTPUT_DIR", "./output")
+    record = load_result(output_dir, doc_id)
+    if record is None:
+        raise HTTPException(
+            status_code=404,
+            detail=f"Document content not found for doc_id: {doc_id}",
+        )
+    markdown = record.get("markdown", "")
+    return {
+        "doc_id": doc_id,
+        "markdown": markdown,
+        "length": len(markdown),
+    }
 
 
 @app.get(
@@ -530,6 +501,7 @@ async def get_content_list(doc_id: str):
     """
     Get document raw content_list
     """
+    _validate_doc_id(doc_id)
     try:
         output_dir = os.getenv("OUTPUT_DIR", "./output")
         output_path = Path(output_dir)
@@ -595,6 +567,7 @@ async def get_middle_json(doc_id: str):
     """
     Get document middle.json content
     """
+    _validate_doc_id(doc_id)
     try:
         output_dir = os.getenv("OUTPUT_DIR", "./output")
         output_path = Path(output_dir)
@@ -670,7 +643,7 @@ async def health_check():
     - RAG instance initialization status
     - LightRAG enabled status
     """
-    enable_lightrag = os.getenv("ENABLE_LIGHTRAG", "true").lower() in ("true", "1", "yes")
+    enable_lightrag = os.getenv("ENABLE_LIGHTRAG", "false").lower() in ("true", "1", "yes")
     return HealthResponse(
         status="healthy",
         service="rag-anything-api",
@@ -683,34 +656,6 @@ async def health_check():
 # ---------------------------------------------------------------------------
 # Result retrieval — called by the webhook receiver after notification
 # ---------------------------------------------------------------------------
-
-class ResultMetadata(BaseModel):
-    """Metadata about a processed document"""
-    parser: str = Field(..., description="Parser used (mineru or docling)", example="mineru")
-    parse_method: str = Field(..., description="Parse method used (auto, ocr, txt)", example="auto")
-    doc_id: str = Field(..., description="RAG-Anything document ID", example="a1b2c3d4e5f6")
-    tables: int = Field(0, description="Number of tables extracted", example=3)
-    formulas: int = Field(0, description="Number of formulas extracted", example=2)
-    images: int = Field(0, description="Number of images extracted", example=5)
-
-
-class DocumentResultResponse(BaseModel):
-    """Full processing result returned by GET /api/v1/result/{doc_id}"""
-    success: bool = Field(..., description="Whether the result was found and loaded")
-    doc_id: str = Field(..., description="RAG-Anything document ID")
-    document_id: str = Field("", description="Caller-supplied document identifier")
-    project_id: str = Field("", description="Caller-supplied project identifier")
-    processed_at: str = Field(..., description="ISO-8601 UTC timestamp of when processing completed")
-    metadata: ResultMetadata = Field(..., description="Processing metadata")
-    markdown: str = Field(..., description="Full Markdown content extracted from the document")
-    content_list: List[Dict[str, Any]] = Field(
-        ...,
-        description=(
-            "Structured content blocks. Each block has a 'type' field: "
-            "'text', 'table', 'equation', or 'image', plus type-specific fields."
-        ),
-    )
-
 
 @app.get(
     "/api/v1/result/{doc_id}",
@@ -804,6 +749,7 @@ async def get_result(doc_id: str):
 
     Call this endpoint from your webhook receiver after receiving a completion notification.
     """
+    _validate_doc_id(doc_id)
     output_dir = os.getenv("OUTPUT_DIR", "./output")
 
     from raganything.result_store import load_result
@@ -868,7 +814,12 @@ async def queue_document(
             status_code=503,
             detail="Document queue not available. Please check Redis connection.",
         )
-    
+
+    _validate_external_url(webhook_url, "webhook_url")
+    _validate_external_url(s3_url, "s3_url")
+    _validate_doc_id(document_id)
+    _validate_doc_id(project_id)
+
     try:
         # Parse processing options
         options = json.loads(processing_options)
@@ -1087,28 +1038,28 @@ async def process_document(
             status_code=503,
             detail="RAG-Anything service not initialized. Please check server logs."
         )
-    
+
+    if webhook_url:
+        _validate_external_url(webhook_url, "webhook_url")
+    if document_id:
+        _validate_doc_id(document_id)
+    if project_id:
+        _validate_doc_id(project_id)
+    suffix = _safe_tempfile_suffix(file.filename)
+
     # Create temporary file for the uploaded file
     temp_file = None
     debug_info = {}
-    
+
     try:
-        # Read file content
-        file_content = await file.read()
-        
-        # Enforce file size limit
-        max_mb = int(os.getenv("MAX_FILE_SIZE_MB", "500"))
-        if len(file_content) > max_mb * 1024 * 1024:
-            raise HTTPException(
-                status_code=413,
-                detail=f"File too large. Maximum allowed size is {max_mb} MB.",
-            )
-        
+        # Read file content with bounded size (streams + aborts on overflow).
+        file_content = await _read_upload_bounded(file)
+
         # Create temporary file
-        with tempfile.NamedTemporaryFile(delete=False, suffix=Path(file.filename).suffix) as tmp:
+        with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp:
             tmp.write(file_content)
             temp_file = tmp.name
-        
+
         logger.info(f"Processing file: {file.filename} (size: {len(file_content)} bytes)")
         
         # Determine parser
@@ -1135,15 +1086,15 @@ async def process_document(
         output_dir = os.getenv("OUTPUT_DIR", "./output")
         os.makedirs(output_dir, exist_ok=True)
         
-        # Acquire semaphore to honour MAX_CONCURRENT_FILES and prevent
-        # concurrent mutations of rag_instance.config.parser.
+        # Acquire semaphore to honour MAX_CONCURRENT_FILES. Pass the per-request
+        # parser through explicitly instead of mutating shared config state.
         async with processing_semaphore:
-            rag_instance.config.parser = selected_parser
             content_list, doc_id = await rag_instance.parse_document(
                 temp_file,
                 output_dir,
                 parse_method,
                 display_stats=True,
+                parser=selected_parser,
                 **parser_kwargs,
             )
         
@@ -1202,6 +1153,7 @@ async def process_document(
             "tables": 0,
             "formulas": 0,
             "images": 0,
+            "vlm_model": None,
         }
         
         for item in content_list:
@@ -1257,6 +1209,19 @@ async def process_document(
                 debug_info["warning"] = "Markdown is empty"
                 debug_info["content_list_sample"] = content_list[:5] if content_list else []
         
+        # VLM image description — standalone image uploads only. Runs after
+        # parsing; failures are swallowed (describe_image returns "").
+        if (
+            os.getenv("ENABLE_IMAGE_VLM", "true").lower() in ("true", "1", "yes")
+            and is_image_file(file.filename)
+            and getattr(rag_instance, "vision_model_func", None)
+        ):
+            vlm_description = await describe_image(temp_file, rag_instance.vision_model_func)
+            if vlm_description:
+                markdown = f"{markdown}\n\n## Image Analysis (VLM)\n\n{vlm_description}"
+                metadata["vlm_model"] = os.getenv("VISION_MODEL", "openai/gpt-4o-mini")
+                logger.info("Added VLM image description for %s", file.filename)
+
         logger.info(f"✅ Successfully processed {file.filename}")
         logger.info(f"   - Tables: {metadata['tables']}, Formulas: {metadata['formulas']}, Images: {metadata['images']}")
         logger.info(f"   - Markdown length: {len(markdown)} chars")
@@ -1279,13 +1244,13 @@ async def process_document(
             if not document_id or not project_id:
                 logger.warning("webhook_url provided but document_id or project_id is missing. Skipping webhook.")
             else:
-                asyncio.create_task(_send_webhook(
+                _fire_and_forget_webhook(
                     webhook_url=webhook_url,
                     doc_id=doc_id,
                     document_id=document_id,
                     project_id=project_id,
                     status="completed",
-                ))
+                )
                 logger.info(f"Webhook notification scheduled for document: {document_id}")
         
         response_data = {
@@ -1299,27 +1264,34 @@ async def process_document(
         
         return ProcessDocumentResponse(**response_data)
         
+    except HTTPException:
+        raise
     except Exception as e:
         logger.error(f"❌ Error processing document: {str(e)}")
         logger.exception(e)
-        
+
         # Send failure notification webhook
         if webhook_url and document_id and project_id:
-            asyncio.create_task(_send_webhook(
+            _fire_and_forget_webhook(
                 webhook_url=webhook_url,
                 doc_id="",
                 document_id=document_id,
                 project_id=project_id,
                 status="failed",
                 error=str(e),
-            ))
+            )
             logger.info(f"Failure webhook notification scheduled for document: {document_id}")
-        
-        return ProcessDocumentResponse(
-            success=False,
-            markdown="",
-            error=str(e),
-            debug_info=debug_info if debug else None,
+
+        # Return 500 with the same response shape so callers checking either
+        # HTTP status or success=False both see the failure.
+        return JSONResponse(
+            status_code=500,
+            content=ProcessDocumentResponse(
+                success=False,
+                markdown="",
+                error=str(e),
+                debug_info=debug_info if debug else None,
+            ).model_dump(),
         )
     
     finally:
@@ -1425,14 +1397,16 @@ async def process_document_stream(
             detail="RAG-Anything service not initialized"
         )
     
+    suffix = _safe_tempfile_suffix(file.filename)
+
     async def generate():
         temp_file = None
         try:
-            # Read file content
-            file_content = await file.read()
-            
+            # Read file content with bounded size (streams + aborts on overflow).
+            file_content = await _read_upload_bounded(file)
+
             # Create temporary file
-            with tempfile.NamedTemporaryFile(delete=False, suffix=Path(file.filename).suffix) as tmp:
+            with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp:
                 tmp.write(file_content)
                 temp_file = tmp.name
             
@@ -1455,14 +1429,15 @@ async def process_document_stream(
                 "backend": backend,
             }
             
-            # Acquire semaphore to honour MAX_CONCURRENT_FILES
+            # Acquire semaphore to honour MAX_CONCURRENT_FILES. Per-request parser
+            # passed explicitly instead of mutating shared config.
             async with processing_semaphore:
-                rag_instance.config.parser = selected_parser
                 content_list, doc_id = await rag_instance.parse_document(
                     temp_file,
                     output_dir,
                     parse_method,
                     display_stats=True,
+                    parser=selected_parser,
                     **parser_kwargs,
                 )
             
@@ -1645,17 +1620,18 @@ async def process_document_content_list(
             detail="RAG-Anything service not initialized. Please check server logs."
         )
     
+    suffix = _safe_tempfile_suffix(file.filename)
     temp_file = None
-    
+
     try:
-        # Read file content
-        file_content = await file.read()
-        
+        # Read file content with bounded size (streams + aborts on overflow).
+        file_content = await _read_upload_bounded(file)
+
         # Create temporary file
-        with tempfile.NamedTemporaryFile(delete=False, suffix=Path(file.filename).suffix) as tmp:
+        with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp:
             tmp.write(file_content)
             temp_file = tmp.name
-        
+
         logger.info(f"Processing file (content_list only): {file.filename} (size: {len(file_content)} bytes)")
         
         # Determine parser
@@ -1681,17 +1657,16 @@ async def process_document_content_list(
         output_dir = os.getenv("OUTPUT_DIR", "./output")
         os.makedirs(output_dir, exist_ok=True)
         
-        # Update config with selected parser
-        rag_instance.config.parser = selected_parser
-        
-        # Parse document using RAG-Anything's parse_document method
-        content_list, doc_id = await rag_instance.parse_document(
-            temp_file,
-            output_dir,
-            parse_method,
-            display_stats=True,
-            **parser_kwargs,
-        )
+        # Acquire semaphore + pass per-request parser through; do not mutate config.
+        async with processing_semaphore:
+            content_list, doc_id = await rag_instance.parse_document(
+                temp_file,
+                output_dir,
+                parse_method,
+                display_stats=True,
+                parser=selected_parser,
+                **parser_kwargs,
+            )
         
         logger.info(f"Parsed document: {len(content_list)} content blocks, doc_id: {doc_id}")
         
@@ -1738,11 +1713,14 @@ async def process_document_content_list(
     except Exception as e:
         logger.error(f"❌ Error processing document (content_list only): {str(e)}")
         logger.exception(e)
-        return ProcessContentListResponse(
-            success=False,
-            content_list=None,
-            metadata=None,
-            error=str(e),
+        return JSONResponse(
+            status_code=500,
+            content=ProcessContentListResponse(
+                success=False,
+                content_list=None,
+                metadata=None,
+                error=str(e),
+            ).model_dump(),
         )
     
     finally:

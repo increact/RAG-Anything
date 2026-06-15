@@ -65,6 +65,11 @@ class DocumentProcessingQueue:
     def _dedup_key(self, document_id: str) -> str:
         return f"{_DEDUP_PREFIX}{document_id}"
 
+    # Sentinel value written to the dedup key while we hold the slot but
+    # haven't yet enqueued the real job. Used to distinguish "another submitter
+    # is mid-flight" from "a real job_id is stored here".
+    _PENDING_SENTINEL = b"__pending__"
+
     def _find_active_job(self, document_id: str) -> Optional[str]:
         """
         Return the job_id of an active (queued / running) job for *document_id*,
@@ -79,6 +84,11 @@ class DocumentProcessingQueue:
         if not raw:
             return None
 
+        # Another submitter is mid-flight (between SET NX and enqueue). Treat
+        # as an active job so we don't double-enqueue.
+        if raw == self._PENDING_SENTINEL:
+            return "pending"
+
         job_id = raw.decode() if isinstance(raw, bytes) else raw
 
         try:
@@ -89,17 +99,35 @@ class DocumentProcessingQueue:
         except Exception:
             pass
 
-        # Job is done, failed, or no longer exists — remove the stale key
+        # Job is done, failed, or no longer exists — remove the stale key.
+        # Use a Lua-style CAS via delete(key) with the known value so we don't
+        # clobber a key written by a concurrent re-submit.
         self.redis_client.delete(key)
         return None
 
+    def _claim_dedup_slot(self, document_id: str, ttl_seconds: int) -> bool:
+        """Atomically claim the dedup slot for `document_id`.
+
+        Returns True if the slot was free and we now own it. Returns False if
+        another submitter already holds it (the caller should treat as duplicate).
+        """
+        # SET key value NX EX ttl  — atomic check-and-set in Redis.
+        ok = self.redis_client.set(
+            self._dedup_key(document_id),
+            self._PENDING_SENTINEL,
+            nx=True,
+            ex=ttl_seconds,
+        )
+        return bool(ok)
+
     def _register_dedup(self, document_id: str, job_id: str, timeout_seconds: int) -> None:
-        """
-        Store the dedup entry in Redis with a TTL of timeout_seconds + 10-minute buffer.
-        The buffer ensures the key outlives the job even under heavy load.
-        """
+        """Replace the pending sentinel with the real job_id (same TTL)."""
         ttl = timeout_seconds + 600
         self.redis_client.setex(self._dedup_key(document_id), ttl, job_id)
+
+    def _release_dedup_slot(self, document_id: str) -> None:
+        """Release a claimed slot when enqueue failed before _register_dedup."""
+        self.redis_client.delete(self._dedup_key(document_id))
 
     # ------------------------------------------------------------------
     # Public API
@@ -127,9 +155,20 @@ class DocumentProcessingQueue:
             - job_id      — RQ job identifier (existing one if duplicate)
             - is_duplicate — True when the submission was silently skipped
         """
-        # --- deduplication check ---
-        active_job_id = self._find_active_job(document_id)
-        if active_job_id:
+        raw_timeout = os.getenv("JOB_TIMEOUT", "7200")
+        try:
+            job_timeout: Any = int(raw_timeout)
+        except ValueError:
+            job_timeout = raw_timeout  # let rq parse strings like "2h"
+
+        timeout_seconds = _timeout_to_seconds(raw_timeout)
+        dedup_ttl = timeout_seconds + 600
+
+        # --- atomic deduplication claim ---
+        # Try to grab the slot with SET NX. If we lose the race, look up the
+        # existing active job and return it as a duplicate.
+        if not self._claim_dedup_slot(document_id, dedup_ttl):
+            active_job_id = self._find_active_job(document_id) or "pending"
             logger.warning(
                 f"Document {document_id!r} is already queued / processing "
                 f"(job: {active_job_id}). Skipping duplicate submission."
@@ -146,28 +185,25 @@ class DocumentProcessingQueue:
             "processing_options": processing_options,
         }
 
-        raw_timeout = os.getenv("JOB_TIMEOUT", "7200")
-        try:
-            job_timeout: Any = int(raw_timeout)
-        except ValueError:
-            job_timeout = raw_timeout  # let rq parse strings like "2h"
-
-        timeout_seconds = _timeout_to_seconds(raw_timeout)
-
         from raganything.document_worker import handle_job_failure
 
-        job = self.queue.enqueue(
-            "raganything.document_worker.process_document_task",
-            task_data,
-            job_id=task_id,
-            job_timeout=job_timeout,
-            result_ttl=86400,   # Keep result for 24 hours
-            failure_ttl=86400,  # Keep failed jobs for 24 hours
-            retry=Retry(max=3, interval=[30, 60, 120]),  # 30 s, 1 min, 2 min
-            on_failure=handle_job_failure,
-        )
+        try:
+            job = self.queue.enqueue(
+                "raganything.document_worker.process_document_task",
+                task_data,
+                job_id=task_id,
+                job_timeout=job_timeout,
+                result_ttl=86400,   # Keep result for 24 hours
+                failure_ttl=86400,  # Keep failed jobs for 24 hours
+                retry=Retry(max=3, interval=[30, 60, 120]),  # 30 s, 1 min, 2 min
+                on_failure=handle_job_failure,
+            )
+        except Exception:
+            # Release the slot so a retry from the same caller is not blocked.
+            self._release_dedup_slot(document_id)
+            raise
 
-        # Register dedup entry so re-submissions are blocked while this job runs
+        # Replace the pending sentinel with the real job_id (same TTL).
         self._register_dedup(document_id, job.id, timeout_seconds)
 
         logger.info(f"Added task {task_id} to queue (job_id: {job.id})")

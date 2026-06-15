@@ -40,12 +40,13 @@ redis_conn = Redis(
 
 # Initialize RAG instance for worker
 from raganything import RAGAnything, RAGAnythingConfig
+from raganything.image_vlm import build_vision_model_func
 from raganything.document_worker import set_rag_instance
 
 logger.info("Initializing RAG instance for worker...")
 
 # Check if LightRAG is enabled
-enable_lightrag = os.getenv("ENABLE_LIGHTRAG", "true").lower() in ("true", "1", "yes")
+enable_lightrag = os.getenv("ENABLE_LIGHTRAG", "false").lower() in ("true", "1", "yes")
 
 try:
     # Create configuration
@@ -57,7 +58,10 @@ try:
         enable_table_processing=True,
         enable_equation_processing=True,
     )
-    
+
+    # Vision model for image description (independent provider, see image_vlm).
+    vision_model_func = build_vision_model_func()
+
     if enable_lightrag:
         try:
             from lightrag.llm.openai import openai_complete_if_cache, openai_embed
@@ -103,6 +107,7 @@ try:
                 config=config,
                 llm_model_func=llm_model_func,
                 embedding_func=embedding_func,
+                vision_model_func=vision_model_func,
             )
             logger.info("✅ RAG-Anything initialized with LightRAG")
         except ImportError:
@@ -111,6 +116,7 @@ try:
                 config=config,
                 llm_model_func=None,
                 embedding_func=None,
+                vision_model_func=vision_model_func,
             )
             rag_instance.lightrag = None
             logger.info("✅ RAG-Anything initialized (parsing only)")
@@ -119,6 +125,7 @@ try:
             config=config,
             llm_model_func=None,
             embedding_func=None,
+            vision_model_func=vision_model_func,
         )
         rag_instance.lightrag = None
         logger.info("✅ RAG-Anything initialized (parsing only, LightRAG disabled)")
@@ -142,10 +149,6 @@ logger.info(f"Max concurrent files: {os.getenv('MAX_CONCURRENT_FILES', '1')}")
 if __name__ == "__main__":
     # In newer versions of rq, Connection is not needed
     # Worker can be created directly with the queue and connection
-    worker = Worker(
-        [queue],
-        connection=redis_conn,
-        name="document-processing-worker",
-    )
+    worker = Worker([queue], connection=redis_conn)
     worker.work()
 

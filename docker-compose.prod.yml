@@ -40,6 +40,11 @@ services:
     container_name: rag-anything-api-prod
     image: rag-anything-api:latest
     restart: always
+    # `mem_limit` is the one that takes effect under `docker compose up` (non-Swarm).
+    # `deploy.resources.limits.memory` below is honoured only in Swarm mode; we keep
+    # both at the same value to document intent.
+    mem_limit: ${MEMORY_LIMIT:-1.5g}
+    memswap_limit: ${MEMORY_LIMIT:-1.5g}
     ports:
       - "8000"
     environment:
@@ -63,7 +68,7 @@ services:
       - ./output:/app/output
       - ./rag_storage:/app/rag_storage
       - ./logs:/app/logs
-      - rag_models_cache:/root/.cache
+      - rag_models_cache:/home/appuser/.cache
     networks:
       - web_proxy
     deploy:
@@ -75,13 +80,7 @@ services:
           cpus: "${CPU_RESERVATION:-0.5}"
           memory: "${MEMORY_RESERVATION:-512M}"
     healthcheck:
-      test:
-        [
-          "CMD",
-          "python",
-          "-c",
-          "import requests; requests.get('http://localhost:8000/health')",
-        ]
+      test: ["CMD", "curl", "--fail", "--silent", "--max-time", "5", "http://localhost:8000/health"]
       interval: 30s
       timeout: 10s
       retries: 3
@@ -101,6 +100,9 @@ services:
     container_name: rag-anything-worker-prod
     image: rag-anything-api:latest
     restart: always
+    # `mem_limit`/`memswap_limit` are the effective caps under non-Swarm
+    # `docker compose up`. The `deploy.resources` block below is honoured only
+    # in Swarm mode; both reference the same env var so they cannot drift.
     mem_limit: ${WORKER_MEMORY_LIMIT:-13g}
     memswap_limit: ${WORKER_MEMSWAP_LIMIT:-14g}
     shm_size: ${WORKER_SHM_SIZE:-2g}
@@ -135,7 +137,7 @@ services:
       - ./output:/app/output
       - ./rag_storage:/app/rag_storage
       - ./logs:/app/logs
-      - rag_models_cache:/root/.cache
+      - rag_models_cache:/home/appuser/.cache
     networks:
       - web_proxy
     depends_on:

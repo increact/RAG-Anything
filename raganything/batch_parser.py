@@ -7,7 +7,7 @@ with progress reporting and error handling.
 
 import asyncio
 import logging
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import ThreadPoolExecutor, as_completed, TimeoutError as FuturesTimeoutError
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 from dataclasses import dataclass
@@ -290,11 +290,22 @@ class BatchParser:
                     for file_path in supported_files
                 }
 
-                # Process completed tasks
-                for future in as_completed(
-                    future_to_file, timeout=self.timeout_per_file
-                ):
-                    success, file_path, error_msg = future.result()
+                # Process completed tasks. The previous `as_completed(...,
+                # timeout=self.timeout_per_file)` applied the timeout to the
+                # ENTIRE iterator wall-clock, not per-file — one slow file
+                # cancelled the whole batch. Apply the timeout per future
+                # instead.
+                for future in as_completed(future_to_file):
+                    file_path = future_to_file[future]
+                    try:
+                        success, file_path, error_msg = future.result(
+                            timeout=self.timeout_per_file
+                        )
+                    except FuturesTimeoutError:
+                        success = False
+                        error_msg = (
+                            f"Timed out after {self.timeout_per_file}s"
+                        )
 
                     if success:
                         successful_files.append(file_path)
@@ -361,10 +372,12 @@ class BatchParser:
         Returns:
             BatchProcessingResult with processing statistics
         """
-        # Run the sync version in a thread pool
+        # Run the sync version in a thread pool. `loop.run_in_executor` only
+        # accepts positional args; bind kwargs with functools.partial so callers
+        # can pass `lang=...`, `device=...`, etc. without hitting TypeError.
+        import functools
         loop = asyncio.get_event_loop()
-        return await loop.run_in_executor(
-            None,
+        bound = functools.partial(
             self.process_batch,
             file_paths,
             output_dir,
@@ -373,6 +386,7 @@ class BatchParser:
             dry_run,
             **kwargs,
         )
+        return await loop.run_in_executor(None, bound)
 
 
 def main():

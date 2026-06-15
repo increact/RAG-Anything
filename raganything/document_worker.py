@@ -10,6 +10,7 @@ import httpx
 from typing import Dict, Any
 from pathlib import Path
 from urllib.parse import urlparse, unquote
+from raganything.image_vlm import is_image_file, describe_image
 
 logger = logging.getLogger(__name__)
 
@@ -21,6 +22,50 @@ def set_rag_instance(instance):
     """Set the global RAG instance"""
     global rag_instance
     rag_instance = instance
+
+
+def _presigned_url_expired(url: str) -> bool:
+    """Detect an expired AWS SigV4 presigned URL from its query string.
+
+    AWS encodes `X-Amz-Date` + `X-Amz-Expires` in the URL; if the sum is in
+    the past, the download will return 403. Returning True lets the caller
+    raise a non-retryable error instead of burning two more retries on a
+    download that cannot succeed. Returns False for non-S3 / non-expiring URLs.
+    """
+    try:
+        from urllib.parse import parse_qs
+        from datetime import datetime, timezone
+        qs = parse_qs(urlparse(url).query)
+        amz_date = qs.get("X-Amz-Date", [None])[0]
+        amz_expires = qs.get("X-Amz-Expires", [None])[0]
+        if not amz_date or not amz_expires:
+            return False
+        signed_at = datetime.strptime(amz_date, "%Y%m%dT%H%M%SZ").replace(tzinfo=timezone.utc)
+        expires_at = signed_at.timestamp() + int(amz_expires)
+        return datetime.now(timezone.utc).timestamp() >= expires_at
+    except Exception:
+        return False
+
+
+class _NonRetryableError(Exception):
+    """Marker exception that RQ retry should treat as terminal."""
+
+
+def _maybe_dockerize_webhook(url: str) -> str:
+    """Optionally rewrite `localhost` in a webhook URL to `host.docker.internal`.
+
+    Only applied when DOCKER_NETWORKING=true. On bare-metal or VM deploys the
+    Docker DNS name does not resolve, so an unconditional rewrite turns every
+    completion webhook into a permanent silent failure.
+    """
+    if not url:
+        return url
+    if os.getenv("DOCKER_NETWORKING", "false").lower() not in ("true", "1", "yes"):
+        return url
+    fixed = url.replace("localhost", "host.docker.internal")
+    if fixed != url:
+        logger.info("Rewrote localhost -> host.docker.internal for Docker networking")
+    return fixed
 
 
 async def process_document_task_async(task_data: Dict[str, Any]) -> Dict[str, Any]:
@@ -53,6 +98,13 @@ async def process_document_task_async(task_data: Dict[str, Any]) -> Dict[str, An
         parsed_url = urlparse(s3_url)
         url_path = unquote(parsed_url.path)  # Decode URL encoding
         file_ext = Path(url_path).suffix or ".pdf"
+
+        # Bail out early on an expired presigned URL so retry attempts don't
+        # waste delay slots downloading a guaranteed-403 URL.
+        if _presigned_url_expired(s3_url):
+            raise _NonRetryableError(
+                "s3_url presigned signature has expired before download"
+            )
 
         # Stream download directly to a temp file to avoid loading the
         # entire file into memory (important for large documents).
@@ -101,17 +153,15 @@ async def process_document_task_async(task_data: Dict[str, Any]) -> Dict[str, An
         else:
             selected_parser = parser
         
-        # Update config
-        rag_instance.config.parser = selected_parser
-        
         logger.info(f"Parsing document with parser: {selected_parser}, method: {parse_method}")
-        
-        # Parse document
+
+        # Parse document — parser passed per-call to avoid mutating shared config
         content_list, doc_id = await rag_instance.parse_document(
             temp_file,
             output_dir,
             parse_method,
             display_stats=True,
+            parser=selected_parser,
             **parser_kwargs,
         )
         
@@ -124,7 +174,25 @@ async def process_document_task_async(task_data: Dict[str, Any]) -> Dict[str, An
         if md_file.exists():
             with open(md_file, "r", encoding="utf-8") as f:
                 markdown = f.read()
-        
+
+        # VLM image description — standalone image uploads only.
+        vlm_model = None
+        if (
+            os.getenv("ENABLE_IMAGE_VLM", "true").lower() in ("true", "1", "yes")
+            and is_image_file(temp_file)
+            and getattr(rag_instance, "vision_model_func", None)
+        ):
+            vlm_description = await describe_image(temp_file, rag_instance.vision_model_func)
+            if vlm_description:
+                markdown = f"{markdown}\n\n## Image Analysis (VLM)\n\n{vlm_description}"
+                # Also surface the description as a text block in content_list
+                # so downstream consumers using structured indexing (which
+                # ignores markdown when content_list is non-empty) still pick
+                # up the VLM analysis.
+                content_list.append({"type": "text", "text": vlm_description})
+                vlm_model = os.getenv("VISION_MODEL", "openai/gpt-4o-mini")
+                logger.info("Added VLM image description for %s", temp_file)
+
         # Build basic metadata counts
         metadata: dict = {
             "parser": selected_parser,
@@ -133,6 +201,7 @@ async def process_document_task_async(task_data: Dict[str, Any]) -> Dict[str, An
             "tables": 0,
             "formulas": 0,
             "images": 0,
+            "vlm_model": vlm_model,
         }
         for item in content_list:
             if isinstance(item, dict):
@@ -144,7 +213,10 @@ async def process_document_task_async(task_data: Dict[str, Any]) -> Dict[str, An
                 elif t == "image":
                     metadata["images"] += 1
 
-        # Persist result to disk so GET /api/v1/result/{doc_id} can serve it
+        # Persist result to disk so GET /api/v1/result/{doc_id} can serve it.
+        # save_result now raises on disk failure — let the exception propagate
+        # so the job is retried and the client is not told `completed` when no
+        # result file exists.
         from raganything.result_store import save_result
         save_result(
             output_dir=output_dir,
@@ -156,11 +228,8 @@ async def process_document_task_async(task_data: Dict[str, Any]) -> Dict[str, An
             metadata=metadata,
         )
 
-        # Fix webhook URL for Docker networking
-        fixed_webhook_url = webhook_url.replace("localhost", "host.docker.internal")
-        if fixed_webhook_url != webhook_url:
-            logger.info(f"Fixed webhook URL for Docker: {webhook_url} -> {fixed_webhook_url}")
-        
+        fixed_webhook_url = _maybe_dockerize_webhook(webhook_url)
+
         # Send a lightweight notification webhook — no content payload.
         # The receiver fetches the full result via GET /api/v1/result/{doc_id}.
         from raganything.webhook_service import WebhookService
@@ -237,26 +306,24 @@ def handle_job_failure(job, connection, type, value, traceback_obj):
             f"Sending failure webhook."
         )
 
-        fixed_webhook_url = webhook_url.replace("localhost", "host.docker.internal")
-        if fixed_webhook_url != webhook_url:
-            logger.info(f"Fixed webhook URL for Docker: {webhook_url} -> {fixed_webhook_url}")
+        fixed_webhook_url = _maybe_dockerize_webhook(webhook_url)
 
-        send_loop = asyncio.new_event_loop()
-        try:
-            from raganything.webhook_service import WebhookService
-            send_loop.run_until_complete(
-                WebhookService.send_webhook_with_retry(
-                    webhook_url=fixed_webhook_url,
-                    doc_id="",
-                    document_id=document_id,
-                    project_id=project_id,
-                    status="failed",
-                    error=error_msg,
-                    max_retries=3,
-                )
+        # asyncio.run() is the safe way to drive an async coroutine from sync
+        # code: it creates a fresh loop, runs the coroutine, then cleanly
+        # cancels any pending tasks and closes the loop. The previous manual
+        # new_event_loop / close pattern leaked tasks on the exception path.
+        from raganything.webhook_service import WebhookService
+        asyncio.run(
+            WebhookService.send_webhook_with_retry(
+                webhook_url=fixed_webhook_url,
+                doc_id="",
+                document_id=document_id,
+                project_id=project_id,
+                status="failed",
+                error=error_msg,
+                max_retries=3,
             )
-        finally:
-            send_loop.close()
+        )
 
     except Exception as e:
         logger.error(f"handle_job_failure: failed to send failure webhook: {e}")

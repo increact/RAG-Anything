@@ -136,13 +136,17 @@ class BatchMixin:
                     self.logger.error(f"Failed to process {file_path}: {str(e)}")
                     return False, str(file_path), str(e)
 
-        # Create tasks for all files
-        for file_path in files_to_process:
-            task = asyncio.create_task(process_single_file(file_path))
-            tasks.append(task)
-
-        # Wait for all tasks to complete
-        results = await asyncio.gather(*tasks, return_exceptions=True)
+        # Create tasks in bounded chunks so a folder of 10k+ files does not
+        # materialise 10k coroutine objects + closures simultaneously. The
+        # semaphore caps execution concurrency, but task allocation itself
+        # has memory cost.
+        chunk_size = max(max_workers * 4, 32)
+        results = []
+        for i in range(0, len(files_to_process), chunk_size):
+            chunk = files_to_process[i : i + chunk_size]
+            chunk_tasks = [asyncio.create_task(process_single_file(fp)) for fp in chunk]
+            chunk_results = await asyncio.gather(*chunk_tasks, return_exceptions=True)
+            results.extend(chunk_results)
 
         # Process results
         successful_files = []
