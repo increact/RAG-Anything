@@ -10,7 +10,8 @@ WORKDIR /app
 # LibreOffice for Office document support
 # Additional tools for document processing
 # curl: used by the healthcheck (smaller and timeout-safe vs python requests)
-RUN apt-get update && apt-get install -y \
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    build-essential \
     libreoffice \
     libreoffice-writer \
     libreoffice-calc \
@@ -22,6 +23,8 @@ RUN apt-get update && apt-get install -y \
     tesseract-ocr-eng \
     fonts-liberation \
     fonts-dejavu \
+    libgl1 \
+    libglib2.0-0 \
     curl \
     && rm -rf /var/lib/apt/lists/*
 

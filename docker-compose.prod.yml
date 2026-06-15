@@ -143,6 +143,11 @@ services:
     depends_on:
       redis:
         condition: service_healthy
+
+    # Worker reuses the API image but doesn't run an HTTP server, so the
+    # image's curl-localhost:8000 healthcheck would always fail.
+    healthcheck:
+      disable: true
     deploy:
       resources:
         limits:
