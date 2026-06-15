@@ -100,6 +100,17 @@ def test_validate_external_url_blocks_loopback_when_public_only(monkeypatch):
         validate_external_url("https://127.0.0.1/cb", "webhook_url")
 
 
+@pytest.mark.parametrize("host", [
+    "[::ffff:169.254.169.254]",  # IPv4-mapped IMDS — dual-stack hosts reach it
+    "[::ffff:127.0.0.1]",        # IPv4-mapped loopback
+    "[::ffff:10.0.0.1]",         # IPv4-mapped private
+])
+def test_validate_external_url_blocks_ipv4_mapped_ipv6_when_public_only(monkeypatch, host):
+    monkeypatch.setenv("PUBLIC_URL_ONLY", "true")
+    with pytest.raises(HTTPException):
+        validate_external_url(f"https://{host}/path", "s3_url")
+
+
 # --- redact_url ------------------------------------------------------------
 
 def test_redact_url_strips_query_and_fragment():

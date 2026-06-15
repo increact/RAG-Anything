@@ -145,7 +145,7 @@ async def verify_api_key(api_key: Optional[str] = Security(api_key_header)):
     # Verify API key using a constant-time comparison so an on-host attacker
     # cannot recover the key character-by-character via timing side channels.
     if not hmac.compare_digest(api_key, configured_api_key):
-        logger.warning(f"Invalid API key attempt: {api_key[:8]}...")
+        logger.warning("Invalid API key attempt (key length: %d)", len(api_key or ""))
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
             detail="Invalid API key",
@@ -896,9 +896,8 @@ async def queue_document(
     ## Parameter Description
     
     - **parser**: Parser selection
-      - `auto`: Automatically select based on file type (recommended)
-      - `mineru`: Use MinerU parser (suitable for PDF, images)
-      - `docling`: Use Docling parser (suitable for Office documents)
+      - `auto`: MinerU (recommended; handles PDF/images/Office via LibreOffice)
+      - `mineru`: Explicit MinerU
     
     - **parse_method**: Parse method
       - `auto`: Automatically select best method
@@ -969,7 +968,7 @@ async def process_document(
     ),
     parser: str = Form(
         "auto",
-        description="Parser selection: auto (automatic), mineru, docling",
+        description="Parser selection: auto or mineru (docling not installed)",
         example="auto",
     ),
     parse_method: str = Form(
@@ -978,9 +977,9 @@ async def process_document(
         example="auto",
     ),
     language: str = Form(
-        "zh",
-        description="Document language (for OCR optimization): zh (Chinese), en (English), etc.",
-        example="zh",
+        "ch",
+        description="MinerU OCR lang code: ch (Chinese), en, japan, korean, etc.",
+        example="ch",
     ),
     device: str = Form(
         "cpu",
@@ -1054,24 +1053,21 @@ async def process_document(
     try:
         # Read file content with bounded size (streams + aborts on overflow).
         file_content = await _read_upload_bounded(file)
+        upload_size = len(file_content)
 
         # Create temporary file
         with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp:
             tmp.write(file_content)
             temp_file = tmp.name
+        # Release the in-memory copy now that the bytes are on disk; the parser
+        # reads from `temp_file`, not from this buffer.
+        del file_content
 
-        logger.info(f"Processing file: {file.filename} (size: {len(file_content)} bytes)")
+        logger.info(f"Processing file: {file.filename} (size: {upload_size} bytes)")
         
-        # Determine parser
-        if parser == "auto":
-            # Auto-select based on file type
-            file_ext = Path(file.filename).suffix.lower()
-            if file_ext in [".doc", ".docx", ".ppt", ".pptx", ".xls", ".xlsx"]:
-                selected_parser = "docling"
-            else:
-                selected_parser = "mineru"
-        else:
-            selected_parser = parser
+        # MinerU handles all supported formats (Office docs via LibreOffice
+        # preprocessing — installed in the image). docling CLI is not installed.
+        selected_parser = "mineru" if parser == "auto" else parser
         
         # Prepare parser kwargs
         parser_kwargs = {
@@ -1366,8 +1362,8 @@ async def process_document_stream(
         description="Parse method",
     ),
     language: str = Form(
-        "zh",
-        description="Document language",
+        "ch",
+        description="MinerU OCR lang code (ch/en/japan/korean/...)",
     ),
     device: str = Form(
         "cpu",
@@ -1409,17 +1405,15 @@ async def process_document_stream(
             with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp:
                 tmp.write(file_content)
                 temp_file = tmp.name
-            
+            # Release the in-memory copy now that the bytes are on disk.
+            del file_content
+
             # Process and yield chunks
             output_dir = os.getenv("OUTPUT_DIR", "./output")
             os.makedirs(output_dir, exist_ok=True)
             
-            # Determine parser
-            if parser == "auto":
-                file_ext = Path(file.filename).suffix.lower()
-                selected_parser = "docling" if file_ext in [".doc", ".docx", ".ppt", ".pptx", ".xls", ".xlsx"] else "mineru"
-            else:
-                selected_parser = parser
+            # MinerU handles all formats; docling CLI is not installed.
+            selected_parser = "mineru" if parser == "auto" else parser
             
             parser_kwargs = {
                 "lang": language,
@@ -1575,7 +1569,7 @@ async def process_document_content_list(
     ),
     parser: str = Form(
         "auto",
-        description="Parser selection: auto (automatic), mineru, docling",
+        description="Parser selection: auto or mineru (docling not installed)",
         example="auto",
     ),
     parse_method: str = Form(
@@ -1584,9 +1578,9 @@ async def process_document_content_list(
         example="auto",
     ),
     language: str = Form(
-        "zh",
-        description="Document language (for OCR optimization): zh (Chinese), en (English), etc.",
-        example="zh",
+        "ch",
+        description="MinerU OCR lang code: ch (Chinese), en, japan, korean, etc.",
+        example="ch",
     ),
     device: str = Form(
         "cpu",
@@ -1626,23 +1620,19 @@ async def process_document_content_list(
     try:
         # Read file content with bounded size (streams + aborts on overflow).
         file_content = await _read_upload_bounded(file)
+        upload_size = len(file_content)
 
         # Create temporary file
         with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp:
             tmp.write(file_content)
             temp_file = tmp.name
+        # Release the in-memory copy now that the bytes are on disk.
+        del file_content
 
-        logger.info(f"Processing file (content_list only): {file.filename} (size: {len(file_content)} bytes)")
+        logger.info(f"Processing file (content_list only): {file.filename} (size: {upload_size} bytes)")
         
-        # Determine parser
-        if parser == "auto":
-            file_ext = Path(file.filename).suffix.lower()
-            if file_ext in [".doc", ".docx", ".ppt", ".pptx", ".xls", ".xlsx"]:
-                selected_parser = "docling"
-            else:
-                selected_parser = "mineru"
-        else:
-            selected_parser = parser
+        # MinerU handles all formats; docling CLI is not installed.
+        selected_parser = "mineru" if parser == "auto" else parser
         
         # Prepare parser kwargs
         parser_kwargs = {

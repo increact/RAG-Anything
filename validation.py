@@ -60,6 +60,12 @@ def validate_external_url(url: str, field: str) -> None:
         raise HTTPException(400, f"{field} resolves to a metadata service")
     try:
         addr = ipaddress.ip_address(host)
+        # `::ffff:169.254.169.254` is an IPv6-encoded IPv4 address that bypasses
+        # the `.is_private` family of checks on the IPv6 form; on dual-stack
+        # hosts (AWS EC2) it still reaches the IPv4 metadata endpoint. Unwrap
+        # to the embedded IPv4 before running the property checks.
+        if isinstance(addr, ipaddress.IPv6Address) and addr.ipv4_mapped is not None:
+            addr = addr.ipv4_mapped
         if addr.is_private or addr.is_loopback or addr.is_link_local or addr.is_multicast:
             if public_only:
                 raise HTTPException(400, f"{field} resolves to a non-public address")

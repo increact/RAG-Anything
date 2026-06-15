@@ -10,7 +10,11 @@ import httpx
 from typing import Dict, Any
 from pathlib import Path
 from urllib.parse import urlparse, unquote
+
+from fastapi import HTTPException
+
 from raganything.image_vlm import is_image_file, describe_image
+from validation import validate_external_url
 
 logger = logging.getLogger(__name__)
 
@@ -89,8 +93,18 @@ async def process_document_task_async(task_data: Dict[str, Any]) -> Dict[str, An
         s3_url = task_data["s3_url"]
         processing_options = task_data["processing_options"]
 
+        # Defense-in-depth: re-validate s3_url at the dereference boundary.
+        # api_server validates before enqueue, but any code path that lands a
+        # job in Redis without going through the API (manual injection, future
+        # internal callers) must not be able to make the worker fetch internal
+        # endpoints — IMDS at 169.254.169.254 is the canonical concern on EC2.
+        try:
+            validate_external_url(s3_url, "s3_url")
+        except HTTPException as e:
+            raise _NonRetryableError(f"s3_url failed validation: {e.detail}") from e
+
         logger.info(f"Processing task {task_id} for document {document_id}")
-        
+
         if rag_instance is None:
             raise Exception("RAG instance not initialized")
         
@@ -125,7 +139,7 @@ async def process_document_task_async(task_data: Dict[str, Any]) -> Dict[str, An
         
         parser = processing_options.get("parser", "auto")
         parse_method = processing_options.get("parse_method", "auto")
-        language = processing_options.get("language", "zh")
+        language = processing_options.get("language", "ch")
         device = processing_options.get("device", "cpu")
         
         # formula/table detection each load a heavy ML model (~700MB-1GB each).
@@ -133,7 +147,7 @@ async def process_document_task_async(task_data: Dict[str, Any]) -> Dict[str, An
         # deployment time without changing caller code.
         # Callers can always override per-request via processing_options.
         formula_default = os.getenv("MINERU_FORMULA_DEFAULT", "false").lower() == "true"
-        table_default = os.getenv("MINERU_TABLE_DEFAULT", "false").lower() == "true"
+        table_default = os.getenv("MINERU_TABLE_DEFAULT", "true").lower() == "true"
 
         parser_kwargs = {
             "lang": language,
@@ -143,15 +157,10 @@ async def process_document_task_async(task_data: Dict[str, Any]) -> Dict[str, An
             "backend": processing_options.get("backend", "pipeline"),
         }
 
-        # Auto-select parser
-        if parser == "auto":
-            file_ext = Path(temp_file).suffix.lower()
-            if file_ext in [".doc", ".docx", ".ppt", ".pptx", ".xls", ".xlsx"]:
-                selected_parser = "docling"
-            else:
-                selected_parser = "mineru"
-        else:
-            selected_parser = parser
+        # MinerU handles all supported formats (Office docs via LibreOffice
+        # preprocessing — installed in the image). The docling CLI is not
+        # installed and routing Office files to it produced a 500 at runtime.
+        selected_parser = "mineru" if parser == "auto" else parser
         
         logger.info(f"Parsing document with parser: {selected_parser}, method: {parse_method}")
 
