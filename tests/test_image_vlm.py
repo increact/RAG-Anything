@@ -24,9 +24,50 @@ def test_is_image_file_rejects_non_images(filename):
     assert image_vlm.is_image_file(filename) is False
 
 
+# --- detect_image_mime / is_image_by_content: magic-byte sniff -----------
+
+@pytest.mark.parametrize("magic,expected_mime", [
+    (b"\xff\xd8\xff\xe0\x00\x10JFIF",          "image/jpeg"),
+    (b"\x89PNG\r\n\x1a\n" + b"\x00" * 8,        "image/png"),
+    (b"GIF89a" + b"\x00" * 6,                   "image/gif"),
+    (b"GIF87a" + b"\x00" * 6,                   "image/gif"),
+    (b"BM" + b"\x00" * 10,                      "image/bmp"),
+    (b"RIFF\x00\x00\x00\x00WEBP",               "image/webp"),
+    (b"II*\x00" + b"\x00" * 8,                  "image/tiff"),
+    (b"MM\x00*" + b"\x00" * 8,                  "image/tiff"),
+])
+def test_detect_image_mime_returns_mime(tmp_path, magic, expected_mime):
+    # File suffix is `.pdf` on purpose — the bug we're fixing was that the
+    # async queue path falls back to .pdf when the s3_url has no extension,
+    # and the old `mimetypes.guess_type` returned "application/pdf".
+    f = tmp_path / "anything.pdf"
+    f.write_bytes(magic + b"\x00" * 16)
+    assert image_vlm.detect_image_mime(str(f)) == expected_mime
+    assert image_vlm.is_image_by_content(str(f)) is True
+
+
+@pytest.mark.parametrize("payload", [
+    b"%PDF-1.7 hello",         # actual PDF
+    b"hello world",            # plain text
+    b"",                       # empty file
+    b"\x00\x01\x02",          # under 4 bytes
+])
+def test_detect_image_mime_rejects_non_images(tmp_path, payload):
+    f = tmp_path / "x.png"     # named .png but actually not an image
+    f.write_bytes(payload)
+    assert image_vlm.detect_image_mime(str(f)) is None
+    assert image_vlm.is_image_by_content(str(f)) is False
+
+
+def test_detect_image_mime_returns_none_for_missing_file(tmp_path):
+    assert image_vlm.detect_image_mime(str(tmp_path / "nope.png")) is None
+    assert image_vlm.is_image_by_content(str(tmp_path / "nope.png")) is False
+
+
 async def test_describe_image_returns_description(tmp_path):
-    img = tmp_path / "x.png"
-    img.write_bytes(b"\x89PNG fake image bytes")
+    # Suffix is .pdf on purpose — describe_image must sniff bytes for MIME.
+    img = tmp_path / "anything.pdf"
+    img.write_bytes(b"\x89PNG\r\n\x1a\n" + b"fake image bytes" + b"\x00" * 16)
     calls = []
 
     async def fake_vision(prompt, image_data=None, system_prompt=None,

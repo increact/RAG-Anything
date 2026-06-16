@@ -6,9 +6,9 @@ upload paths to attach a natural-language description of an uploaded image to
 the parse result.
 """
 import logging
-import mimetypes
 import os
 from pathlib import Path
+from typing import Optional
 
 from raganything.utils import encode_image_to_base64
 
@@ -24,6 +24,43 @@ def is_image_file(filename: str) -> bool:
     if not filename:
         return False
     return Path(filename).suffix.lower() in IMAGE_EXTENSIONS
+
+
+def detect_image_mime(path: str) -> Optional[str]:
+    """Return the IANA MIME type by sniffing the file header, or None.
+
+    Suffix-based detection (`mimetypes.guess_type`) is unreliable on the async
+    queue path: the tempfile suffix is derived from the `s3_url` path
+    (`Path(url_path).suffix or ".pdf"`), and presigned URLs usually have no
+    extension. The fallback `.pdf` then produces `application/pdf`, which the
+    VLM provider rejects with "invalid_image_format". Sniff magic bytes so the
+    MIME matches the real content. Pure stdlib — no PIL/imghdr dependency.
+    """
+    try:
+        with open(path, "rb") as f:
+            head = f.read(12)
+    except OSError:
+        return None
+    if len(head) < 4:
+        return None
+    if head.startswith(b"\xff\xd8\xff"):
+        return "image/jpeg"
+    if head.startswith(b"\x89PNG\r\n\x1a\n"):
+        return "image/png"
+    if head[:6] in (b"GIF87a", b"GIF89a"):
+        return "image/gif"
+    if head.startswith(b"BM"):
+        return "image/bmp"
+    if len(head) >= 12 and head[:4] == b"RIFF" and head[8:12] == b"WEBP":
+        return "image/webp"
+    if head[:4] in (b"II*\x00", b"MM\x00*"):
+        return "image/tiff"
+    return None
+
+
+def is_image_by_content(path: str) -> bool:
+    """True when the file at `path` is a recognised image by magic bytes."""
+    return detect_image_mime(path) is not None
 
 
 _SYSTEM_PROMPT = (
@@ -48,9 +85,11 @@ async def describe_image(image_path: str, vision_model_func) -> str:
     image_b64 = encode_image_to_base64(image_path)
     if not image_b64:
         return ""
-    # Use the real MIME type so non-JPEG images (PNG is the common case) are
-    # not mislabelled in the data URL — stricter VLM providers reject that.
-    mime_type = mimetypes.guess_type(image_path)[0] or "image/jpeg"
+    # Sniff bytes for the MIME — `mimetypes.guess_type` follows the suffix
+    # and the async queue path can give us a `.pdf` tempfile holding real
+    # image bytes. OpenRouter / Azure reject `application/pdf` in the data
+    # URL even when the payload is genuinely an image.
+    mime_type = detect_image_mime(image_path) or "image/jpeg"
     try:
         result = await vision_model_func(
             _USER_PROMPT,

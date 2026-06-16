@@ -13,7 +13,7 @@ from urllib.parse import urlparse, unquote
 
 from fastapi import HTTPException
 
-from raganything.image_vlm import is_image_file, describe_image
+from raganything.image_vlm import is_image_by_content, describe_image
 from validation import validate_external_url
 
 logger = logging.getLogger(__name__)
@@ -188,7 +188,7 @@ async def process_document_task_async(task_data: Dict[str, Any]) -> Dict[str, An
         vlm_model = None
         if (
             os.getenv("ENABLE_IMAGE_VLM", "true").lower() in ("true", "1", "yes")
-            and is_image_file(temp_file)
+            and is_image_by_content(temp_file)
             and getattr(rag_instance, "vision_model_func", None)
         ):
             vlm_description = await describe_image(temp_file, rag_instance.vision_model_func)

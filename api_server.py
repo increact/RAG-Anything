@@ -26,7 +26,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.openapi.utils import get_openapi
 from dotenv import load_dotenv
 
-from raganything.image_vlm import build_vision_model_func, is_image_file, describe_image
+from raganything.image_vlm import build_vision_model_func, is_image_by_content, describe_image
 
 from api_models import (
     DocumentMetadata,
@@ -1209,7 +1209,7 @@ async def process_document(
         # parsing; failures are swallowed (describe_image returns "").
         if (
             os.getenv("ENABLE_IMAGE_VLM", "true").lower() in ("true", "1", "yes")
-            and is_image_file(file.filename)
+            and is_image_by_content(temp_file)
             and getattr(rag_instance, "vision_model_func", None)
         ):
             vlm_description = await describe_image(temp_file, rag_instance.vision_model_func)
